@@ -1,0 +1,24 @@
+PackageIdentifier: polaproject.TokenUsageBar
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: polaproject
+PublisherUrl: https://github.com/polaproject
+PackageName: Token Usage Bar
+PackageUrl: https://github.com/polaproject/token-usage-bar
+License: MIT
+LicenseUrl: https://github.com/polaproject/token-usage-bar/blob/main/LICENSE
+ShortDescription: A tiny taskbar bar showing your Claude usage limits (unofficial).
+Description: |-
+  Token Usage Bar is a tiny always-on-top widget that shows how much of your
+  Claude usage limits you've consumed — the same numbers as Claude Code's
+  /usage. It docks onto the empty area of the Windows taskbar. Unofficial; not
+  affiliated with or endorsed by Anthropic.
+Tags:
+  - claude
+  - claude-code
+  - usage
+  - taskbar
+  - tray
+  - widget
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
