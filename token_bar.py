@@ -46,7 +46,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -231,6 +231,28 @@ class RateLimited(Exception):
     def __init__(self, retry_after):
         super().__init__("rate limited")
         self.retry_after = retry_after
+
+
+def _friendly_error(e):
+    """Turn a fetch_usage exception into a short, human-readable status line for
+    the tooltip — never the raw 'The read operation timed out' / stack noise."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (401, 403):
+            return "sign-in expired — open Claude Code, then Refresh"
+        if e.code == 429:
+            return "rate limited — waiting to retry"
+        if 500 <= e.code < 600:
+            return f"server busy ({e.code}) — retrying"
+        return f"server error {e.code} — retrying"
+    if isinstance(e, TimeoutError) or "timed out" in str(e).lower():
+        return "network slow — retrying"
+    if isinstance(e, urllib.error.URLError):
+        return "no connection — retrying"
+    if isinstance(e, KeyError):
+        return "credentials incomplete — re-login Claude Code"
+    if isinstance(e, json.JSONDecodeError):
+        return "unexpected response — retrying"
+    return (str(e) or e.__class__.__name__)[:60]
 
 
 # ---------------------------------------------------------------- usage fetch
@@ -749,9 +771,10 @@ class TokenBar:
         except RateLimited as e:
             self.root.after(0, self._on_rate_limit, e.retry_after)
         except FileNotFoundError:
-            self.root.after(0, self._on_error, "no credentials", SLOW_SECONDS)
+            self.root.after(0, self._on_error,
+                            "sign in to Claude Code first", SLOW_SECONDS)
         except Exception as e:
-            self.root.after(0, self._on_error, str(e)[:30], SLOW_SECONDS)
+            self.root.after(0, self._on_error, _friendly_error(e), SLOW_SECONDS)
 
     def _on_success(self, fh, sd, reset):
         self._backoff = FAST_SECONDS
