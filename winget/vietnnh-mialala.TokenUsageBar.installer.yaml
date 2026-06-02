@@ -13,6 +13,6 @@ ReleaseDate: 2026-06-02
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/vietnnh-mialala/token-usage-bar/releases/download/v1.0.3/TokenUsageBar.exe
-    InstallerSha256: 7DCB92856C9B9EA162379B03765A9490D11E76212C031344012F359926442F87
+    InstallerSha256: 1F40B7A88E9618E9AF2BC20D702700906E476E1EC4B250B7B199659C8184D05D
 ManifestType: installer
 ManifestVersion: 1.6.0
