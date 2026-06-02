@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -91,6 +91,8 @@ HIDDEN_SECONDS = 300       # when the widget is hidden to the tray
 RL_BACKOFF_MAX = 300       # cap on rate-limit back-off so the dot recovers fast
 FRESH_SECONDS = 60         # dot is green while the last good sync is this recent
 TIMEOUT = 15
+UPDATE_CHECK_SECONDS = 6 * 3600   # re-check GitHub for a newer release this often
+                                  # (so long-running instances notice updates too)
 REFRESH_GRACE_SECONDS = 8  # wait this long for Claude Code to refresh the shared
                            # token before the widget refreshes it itself
 HOVER_ALPHA = 0.95         # opacity when the mouse is over the window
@@ -654,7 +656,8 @@ class TokenBar:
         self.refresh_async()
         self._dim_tick()
         self._tick_clock()          # 1 s heartbeat: countdown + freshness + topmost
-        self.root.after(3000, self._check_update)   # one-shot GitHub update check
+        self.root.after(3000, self._check_update)   # first GitHub update check
+                                                     # (then re-arms every 6h)
 
     def _s(self, px):
         """Scale a pixel measurement for the current display DPI."""
@@ -820,8 +823,11 @@ class TokenBar:
             self.root.after(1200, self._open_releases)
 
     def _check_update(self):
-        """Ask GitHub for the latest release tag in a background thread."""
+        """Ask GitHub for the latest release tag in a background thread, then
+        re-arm so a long-running instance keeps noticing new releases without a
+        restart."""
         threading.Thread(target=self._update_worker, daemon=True).start()
+        self.root.after(UPDATE_CHECK_SECONDS * 1000, self._check_update)
 
     def _update_worker(self):
         try:
