@@ -1,0 +1,36 @@
+========================================
+ Token Usage Bar — Hướng dẫn cài đặt
+========================================
+
+Thanh hiển thị mức dùng Claude (5h + 7d) ngay trên taskbar Windows.
+
+YÊU CẦU
+  - Windows 10/11
+  - Đã đăng nhập Claude Code trên máy ít nhất 1 lần
+
+CÀI ĐẶT (3 bước)
+  1) Bạn đang đọc file này nghĩa là đã giải nén xong.
+     (Nếu chưa: chuột phải TokenUsageBar.zip -> Extract All...)
+  2) Double-click   Install.cmd
+  3) Đợi cửa sổ chạy xong -> nhấn Enter.
+
+  => Thanh bar hiện ở góc trái taskbar và tự khởi động cùng Windows.
+
+NẾU WINDOWS CẢNH BÁO
+  "Windows protected your PC" -> More info -> Run anyway.
+  (App an toàn, chỉ chưa mua chứng chỉ ký số.)
+
+SỬ DỤNG
+  - Chuột phải vào thanh bar (hoặc icon ở khay tray, góc phải)
+    -> Refresh now / Check for updates / Quit ...
+  - Double-click thanh bar -> ẩn xuống khay tray.
+
+GỠ CÀI ĐẶT
+  Double-click   Uninstall.cmd
+
+⚠️ LƯU Ý QUAN TRỌNG
+  Luôn dùng  Install.cmd / Uninstall.cmd.
+  ĐỪNG chuột phải file .ps1 -> Run with PowerShell (Windows sẽ chặn).
+
+Trang chủ / cập nhật mới nhất:
+  https://github.com/vietnnh-mialala/token-usage-bar/releases/latest

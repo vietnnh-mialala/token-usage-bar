@@ -19,7 +19,7 @@ $rel = Join-Path $PSScriptRoot 'release\TokenUsageBar'
 New-Item -ItemType Directory -Force -Path $rel | Out-Null
 Get-ChildItem $rel -File -ErrorAction SilentlyContinue | Remove-Item -Force
 $payload = 'dist\TokenUsageBar.exe','Install.cmd','Uninstall.cmd',
-           'install.ps1','uninstall.ps1','README.md','LICENSE'
+           'install.ps1','uninstall.ps1','QUICKSTART.txt','README.md','LICENSE'
 Copy-Item $payload $rel -Force
 $zip = Join-Path $PSScriptRoot 'release\TokenUsageBar.zip'
 Compress-Archive -Path (Join-Path $rel '*') -DestinationPath $zip -Force
@@ -29,7 +29,7 @@ $h | Out-File -Encoding ascii (Join-Path $PSScriptRoot 'release\TokenUsageBar.ex
 # Guard: never ship a zip missing a required file.
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $names = [System.IO.Compression.ZipFile]::OpenRead($zip).Entries.FullName
-foreach ($req in 'Install.cmd','Uninstall.cmd','install.ps1','uninstall.ps1','TokenUsageBar.exe','README.md','LICENSE') {
+foreach ($req in 'Install.cmd','Uninstall.cmd','install.ps1','uninstall.ps1','TokenUsageBar.exe','QUICKSTART.txt','README.md','LICENSE') {
     if ($names -notcontains $req) { throw "Packaging error: '$req' missing from TokenUsageBar.zip" }
 }
 Write-Host "Packaged: $zip"

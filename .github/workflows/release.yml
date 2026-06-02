@@ -40,13 +40,13 @@ jobs:
           # double-clicking them is the only install path that survives the default
           # RemoteSigned policy (right-clicking a downloaded .ps1 is blocked).
           $payload = 'dist/TokenUsageBar.exe','Install.cmd','Uninstall.cmd',
-                     'install.ps1','uninstall.ps1','README.md','LICENSE'
+                     'install.ps1','uninstall.ps1','QUICKSTART.txt','README.md','LICENSE'
           Copy-Item $payload $rel
           Compress-Archive -Path "$rel/*" -DestinationPath "TokenUsageBar.zip" -Force
           # Guard: fail the release if any required file didn't make it into the zip.
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $names = [System.IO.Compression.ZipFile]::OpenRead("$PWD/TokenUsageBar.zip").Entries.FullName
-          foreach ($req in 'Install.cmd','Uninstall.cmd','install.ps1','uninstall.ps1','TokenUsageBar.exe','README.md','LICENSE') {
+          foreach ($req in 'Install.cmd','Uninstall.cmd','install.ps1','uninstall.ps1','TokenUsageBar.exe','QUICKSTART.txt','README.md','LICENSE') {
             if ($names -notcontains $req) { throw "Packaging error: '$req' missing from TokenUsageBar.zip" }
           }
           Write-Host "Zip OK - contains: $($names -join ', ')"
