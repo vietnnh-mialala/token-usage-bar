@@ -20,6 +20,25 @@ try {
     Get-ChildItem -Path $PSScriptRoot -Recurse -ErrorAction SilentlyContinue |
         Unblock-File -ErrorAction SilentlyContinue
 
+    # Token Usage Bar shows your usage FROM Claude Code, so it needs Claude Code
+    # (the CLI) on this PC. Warn early if it isn't here, rather than letting the
+    # widget sit on "needs Claude Code" after install.
+    $hasCli = [bool](Get-Command claude -ErrorAction SilentlyContinue) `
+              -or (Test-Path (Join-Path $env:USERPROFILE '.local\bin\claude.exe'))
+    $hasCreds = Test-Path (Join-Path $env:USERPROFILE '.claude\.credentials.json')
+    if (-not ($hasCli -or $hasCreds)) {
+        Write-Host ''
+        Write-Host 'NOTE: Claude Code was not detected on this PC.' -ForegroundColor Yellow
+        Write-Host 'Token Usage Bar mirrors Claude Code''s usage, so it will not show'
+        Write-Host 'any data until Claude Code (the CLI) is installed and signed in:'
+        Write-Host '    irm https://claude.ai/install.ps1 | iex     then:   claude  ->  /login'
+        $ans = Read-Host 'Install the widget anyway? [Y/n]'
+        if ($ans -and $ans.Trim() -notmatch '^(y|yes)$') {
+            Write-Host 'Cancelled - nothing was installed.'
+            Close-WithPause 0
+        }
+    }
+
     # locate the exe next to this script, or in a dist\ subfolder
     $src = $null
     foreach ($p in @((Join-Path $PSScriptRoot 'TokenUsageBar.exe'),

@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -523,7 +523,8 @@ class TokenBar:
         self._tray_pct = None     # last (fh,sd) drawn into the tray icon
         self._last_ok = None      # time.monotonic() of the last successful sync
         self._dot_color = None    # current dot fill (avoid redundant redraws)
-        self._needs_login = False  # True when the refresh token is dead (sign in)
+        self._needs_login = False  # True when sign-in / setup is needed
+        self._setup_mode = False   # True when Claude Code isn't on this PC at all
         self._docked = False      # True while overlaying the taskbar
         self._dock_screen_y = 0   # screen y (centred in the taskbar band) when docked
         self._update_ver = None   # set when a newer release is found on GitHub
@@ -622,6 +623,7 @@ class TokenBar:
             command=lambda: self._set_autostart(self._autostart_var.get()))
         self.menu.add_command(label="🔑 Sign in to Claude…",
                               command=self._sign_in)
+        self._signin_idx = self.menu.index("end")   # relabelled in setup mode
         self.menu.add_command(label="Check for updates…",
                               command=self._open_releases)
         self.menu.add_separator()
@@ -938,22 +940,41 @@ class TokenBar:
         self._schedule_next(wait)
 
     def _on_needs_login(self):
-        """Refresh token is dead -> make it loud and one-click to fix."""
+        """Sign-in / setup needed -> make it loud and actionable. Distinguish two
+        cases: 'setup' (Claude Code isn't on this PC at all) vs 'sign in' (it is,
+        but the token is dead)."""
         first = not self._needs_login
         self._needs_login = True
+        # setup = no creds file AND no CLI -> the widget can't work here yet
+        self._setup_mode = (not os.path.exists(CRED_PATH)
+                            and self._find_claude_cli() is None)
         self._update_dot()                 # dot -> red
-        self._update_reset_label()         # countdown -> "⚠ sign in"
+        self._update_reset_label()         # countdown -> "⚠ setup" / "⚠ sign in"
+        # relabel the menu action to match the situation
+        try:
+            self.menu.entryconfig(
+                self._signin_idx,
+                label=("⚙ Set up Claude Code…" if self._setup_mode
+                       else "🔑 Sign in to Claude…"))
+        except (tk.TclError, AttributeError):
+            pass
         if self.icon is not None:
             try:
-                self.icon.title = (f"{APP_NAME} — sign in needed "
-                                   f"(right-click ▸ Sign in to Claude)")
+                if self._setup_mode:
+                    self.icon.title = (f"{APP_NAME} — needs Claude Code "
+                                       f"(right-click ▸ Set up Claude Code)")
+                    msg = ("Token Usage Bar needs Claude Code on this PC. "
+                           "Right-click the bar → Set up Claude Code.")
+                else:
+                    self.icon.title = (f"{APP_NAME} — sign in needed "
+                                       f"(right-click ▸ Sign in to Claude)")
+                    msg = ("Sign-in expired. Right-click the bar → "
+                           "Sign in to Claude.")
                 if first:                  # toast once per transition, not every poll
-                    self.icon.notify(
-                        "Sign-in expired. Right-click the bar → "
-                        "Sign in to Claude.", APP_NAME)
+                    self.icon.notify(msg, APP_NAME)
             except Exception:
                 pass
-        # keep polling so we recover automatically once the user signs in
+        # keep polling so we recover automatically once it's set up / signed in
         self._schedule_next(60)
 
     def _find_claude_cli(self):
@@ -1025,7 +1046,14 @@ class TokenBar:
             canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=c, width=0)
 
     def _render(self, fh, sd, reset):
-        self._needs_login = False          # a good sync clears the sign-in state
+        if self._needs_login:              # a good sync clears the sign-in/setup state
+            self._needs_login = False
+            self._setup_mode = False
+            try:
+                self.menu.entryconfig(self._signin_idx,
+                                      label="🔑 Sign in to Claude…")
+            except (tk.TclError, AttributeError):
+                pass
         self._last = (fh, sd)
         for key, pct in (("5h", fh), ("7d", sd)):
             val, canvas = self.rows[key]
@@ -1059,7 +1087,8 @@ class TokenBar:
     # ---- 5h-reset countdown (local, network-independent)
     def _update_reset_label(self):
         if self._needs_login:
-            self.reset_lbl.config(text="⚠ sign in", fg=DOT_ERR)
+            self.reset_lbl.config(text="⚠ setup" if self._setup_mode
+                                  else "⚠ sign in", fg=DOT_ERR)
         else:
             self.reset_lbl.config(text="⟳ " + _reset_compact(self._reset_iso),
                                   fg=FG)
