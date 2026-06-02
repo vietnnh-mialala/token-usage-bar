@@ -36,8 +36,20 @@ jobs:
         run: |
           $rel = "release/TokenUsageBar"
           New-Item -ItemType Directory -Force -Path $rel | Out-Null
-          Copy-Item dist/TokenUsageBar.exe,install.ps1,uninstall.ps1,README.md,LICENSE $rel
+          # Keep this list in sync with build.ps1. The .cmd launchers are REQUIRED —
+          # double-clicking them is the only install path that survives the default
+          # RemoteSigned policy (right-clicking a downloaded .ps1 is blocked).
+          $payload = 'dist/TokenUsageBar.exe','Install.cmd','Uninstall.cmd',
+                     'install.ps1','uninstall.ps1','README.md','LICENSE'
+          Copy-Item $payload $rel
           Compress-Archive -Path "$rel/*" -DestinationPath "TokenUsageBar.zip" -Force
+          # Guard: fail the release if any required file didn't make it into the zip.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $names = [System.IO.Compression.ZipFile]::OpenRead("$PWD/TokenUsageBar.zip").Entries.FullName
+          foreach ($req in 'Install.cmd','Uninstall.cmd','install.ps1','uninstall.ps1','TokenUsageBar.exe','README.md','LICENSE') {
+            if ($names -notcontains $req) { throw "Packaging error: '$req' missing from TokenUsageBar.zip" }
+          }
+          Write-Host "Zip OK - contains: $($names -join ', ')"
           $h = (Get-FileHash dist/TokenUsageBar.exe -Algorithm SHA256).Hash
           "$h  TokenUsageBar.exe" | Out-File -Encoding ascii TokenUsageBar.exe.sha256
           Write-Host "SHA256 (put this in the winget installer manifest): $h"
