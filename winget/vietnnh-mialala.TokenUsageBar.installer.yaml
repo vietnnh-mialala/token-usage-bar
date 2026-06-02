@@ -1,10 +1,10 @@
 # Installer manifest for winget. Submit the trio in this folder to
-# https://github.com/microsoft/winget-pkgs (path: manifests/v/vietnnh-mialala/TokenUsageBar/1.0.2/)
+# https://github.com/microsoft/winget-pkgs (path: manifests/v/vietnnh-mialala/TokenUsageBar/1.0.3/)
 # IMPORTANT: keep InstallerSha256 in sync with the SHA256 of the EXACT exe
 # attached to the GitHub release (run:
 #   (Get-FileHash dist\TokenUsageBar.exe -Algorithm SHA256).Hash )
 PackageIdentifier: vietnnh-mialala.TokenUsageBar
-PackageVersion: 1.0.2
+PackageVersion: 1.0.3
 MinimumOSVersion: 10.0.0.0
 InstallerType: portable
 Commands:
@@ -12,7 +12,7 @@ Commands:
 ReleaseDate: 2026-06-02
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/vietnnh-mialala/token-usage-bar/releases/download/v1.0.2/TokenUsageBar.exe
-    InstallerSha256: DDF8579CE32C8EC3C7F4B7CE837FDCE339E3C565117C6C4BFA128E1A7EE340AC
+    InstallerUrl: https://github.com/vietnnh-mialala/token-usage-bar/releases/download/v1.0.3/TokenUsageBar.exe
+    InstallerSha256: 7DCB92856C9B9EA162379B03765A9490D11E76212C031344012F359926442F87
 ManifestType: installer
 ManifestVersion: 1.6.0
