@@ -16,9 +16,11 @@ Controls:
   - Double-click the window -> hide to tray
 """
 
+import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import threading
@@ -46,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -255,6 +257,15 @@ def _friendly_error(e):
     return (str(e) or e.__class__.__name__)[:60]
 
 
+def _sha256_file(path):
+    """Streaming SHA-256 of a file, lowercase hex."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # ---------------------------------------------------------------- usage fetch
 
 
@@ -374,20 +385,32 @@ def make_tray_image(fh, sd):
 _SINGLE_INSTANCE_MUTEX = None  # kept alive for the whole process lifetime
 
 
-def acquire_single_instance():
+def acquire_single_instance(wait_seconds=0):
     """Return True if we are the only instance, False if one is already running.
 
     Uses a named Windows mutex (per-user session). On any platform without
     ctypes this is a no-op that always returns True.
+
+    wait_seconds > 0 retries until the existing instance exits — used right after
+    a self-update relaunch, where the old exe is still shutting down and would
+    otherwise make the freshly-installed copy think a duplicate is running.
     """
     global _SINGLE_INSTANCE_MUTEX
     if ctypes is None or not hasattr(ctypes, "windll"):
         return True
     ERROR_ALREADY_EXISTS = 183
     k32 = ctypes.windll.kernel32
-    _SINGLE_INSTANCE_MUTEX = k32.CreateMutexW(None, False,
-                                              APP_SLUG + "_singleton")
-    return k32.GetLastError() != ERROR_ALREADY_EXISTS
+    deadline = time.time() + max(0, wait_seconds)
+    while True:
+        mutex = k32.CreateMutexW(None, False, APP_SLUG + "_singleton")
+        if k32.GetLastError() != ERROR_ALREADY_EXISTS:
+            _SINGLE_INSTANCE_MUTEX = mutex
+            return True
+        if mutex:
+            k32.CloseHandle(mutex)         # release the duplicate handle
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
 
 
 def is_session_locked():
@@ -694,6 +717,79 @@ class TokenBar:
             except Exception:
                 pass
 
+    # ---- one-click self-update (download + verify + swap + relaunch) ------
+    def _do_update(self):
+        """Triggered by the 'Update available' link. Download the newer exe and
+        swap it in. Falls back to just opening the page when not runnable as a
+        self-update (running from source, or no known newer version)."""
+        if not getattr(sys, "frozen", False) or not self._update_ver:
+            self._open_releases()
+            return
+        if getattr(self, "_updating", False):
+            return                          # already in progress
+        self._updating = True
+        threading.Thread(target=self._update_install_worker, daemon=True).start()
+
+    def _fetch_text(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": APP_SLUG})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.read().decode("utf-8", "replace")
+
+    def _update_install_worker(self):
+        tag = self._update_ver
+        cur = sys.executable                       # ...\TokenUsageBar.exe
+        exe_dir = os.path.dirname(cur)
+        new_tmp = os.path.join(exe_dir, APP_SLUG + ".new.exe")
+        old = os.path.join(exe_dir, APP_SLUG + ".old.exe")
+        base = f"https://github.com/{REPO}/releases/download/v{tag}"
+        try:
+            self.root.after(0, self._error, f"downloading v{tag}…")
+            # 1. download the new exe to a temp file in the same folder
+            req = urllib.request.Request(f"{base}/{APP_SLUG}.exe",
+                                         headers={"User-Agent": APP_SLUG})
+            with urllib.request.urlopen(req, timeout=120) as r, \
+                    open(new_tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            # 2. verify the published SHA-256 before trusting the binary
+            self.root.after(0, self._error, f"verifying v{tag}…")
+            want = self._fetch_text(f"{base}/{APP_SLUG}.exe.sha256").split()[0].strip().lower()
+            got = _sha256_file(new_tmp).lower()
+            if want and got != want:
+                raise ValueError("checksum mismatch — aborting update")
+            # 3. swap: rename the running exe aside (Windows allows this), then
+            #    move the verified new exe into its place
+            if os.path.exists(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            os.replace(cur, old)
+            os.replace(new_tmp, cur)
+            # 4. relaunch the new exe (it waits for us to exit via --updated),
+            #    then quit this instance
+            subprocess.Popen(
+                [cur, "--updated"],
+                creationflags=(getattr(subprocess, "DETACHED_PROCESS", 0)
+                               | getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                close_fds=True)
+            self.root.after(0, self.quit)
+        except Exception as e:
+            # restore the original exe if we renamed it but didn't finish, and
+            # fall back to opening the download page so the user isn't stuck
+            try:
+                if not os.path.exists(cur) and os.path.exists(old):
+                    os.replace(old, cur)
+            except OSError:
+                pass
+            try:
+                if os.path.exists(new_tmp):
+                    os.remove(new_tmp)
+            except OSError:
+                pass
+            self._updating = False
+            self.root.after(0, self._error, "update failed — opening page")
+            self.root.after(1200, self._open_releases)
+
     def _check_update(self):
         """Ask GitHub for the latest release tag in a background thread."""
         threading.Thread(target=self._update_worker, daemon=True).start()
@@ -713,9 +809,9 @@ class TokenBar:
 
     def _on_update_available(self, tag):
         self._update_ver = tag
-        try:                # turn the version header into a clickable update link
-            self.menu.entryconfig(0, label=f"⬆ Update available: v{tag}",
-                                  state="normal", command=self._open_releases)
+        try:                # turn the version header into a one-click installer
+            self.menu.entryconfig(0, label=f"⬆ Update to v{tag} (click to install)",
+                                  state="normal", command=self._do_update)
         except tk.TclError:
             pass
         if self.icon is not None:
@@ -1011,9 +1107,27 @@ class TokenBar:
         self.root.destroy()
 
 
+def _cleanup_after_update():
+    """Remove the previous exe left behind by a self-update swap (best-effort)."""
+    if not getattr(sys, "frozen", False):
+        return
+    old = os.path.join(os.path.dirname(sys.executable), APP_SLUG + ".old.exe")
+    for _ in range(10):
+        if not os.path.exists(old):
+            return
+        try:
+            os.remove(old)
+            return
+        except OSError:
+            time.sleep(0.3)            # the old process may still be exiting
+
+
 def main():
     enable_dpi_awareness()         # crisp text on scaled (125% etc) displays
-    if not acquire_single_instance():
+    # after a self-update relaunch (--updated) the old copy is still shutting
+    # down, so wait briefly for its single-instance mutex to free up
+    updated = "--updated" in sys.argv
+    if not acquire_single_instance(8 if updated else 0):
         # another copy is already running -> don't add load on the API
         try:
             if ctypes and hasattr(ctypes, "windll"):
@@ -1023,6 +1137,9 @@ def main():
         except Exception:
             pass
         sys.exit(0)
+
+    if updated:
+        _cleanup_after_update()    # delete the previous exe the swap left behind
 
     root = tk.Tk()
     root.title(APP_NAME)
