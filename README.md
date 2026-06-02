@@ -122,9 +122,12 @@ your usage limits; it only reads the meter.
 ## How it works
 - Reads your OAuth token from `~/.claude/.credentials.json` (written by Claude Code).
 - Polls `https://api.anthropic.com/api/oauth/usage` on the adaptive schedule above.
-- Auto-refreshes the access token via `https://platform.claude.com/v1/oauth/token`
-  when it's near expiry (or on a 401/403), so it keeps working even if you haven't
-  run Claude Code in a while.
+- Lets **Claude Code own the token lifecycle**: it reads the access token from
+  disk and only refreshes *reactively* — if a usage call returns 401/403 it waits
+  a short grace period for Claude Code to rotate the shared refresh token, and
+  refreshes itself only as a last resort (e.g. Claude Code isn't running). This
+  avoids both the widget and Claude Code rotating the one shared refresh token at
+  once (which would 403 the loser), while still keeping the bar working on its own.
 - Crisp on scaled (125 % etc.) displays — it's DPI-aware, so its coordinates are
   in physical pixels.
 

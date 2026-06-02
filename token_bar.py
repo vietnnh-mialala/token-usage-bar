@@ -18,6 +18,7 @@ Controls:
 
 import json
 import os
+import shutil
 import sys
 import time
 import threading
@@ -88,6 +89,8 @@ HIDDEN_SECONDS = 300       # when the widget is hidden to the tray
 RL_BACKOFF_MAX = 300       # cap on rate-limit back-off so the dot recovers fast
 FRESH_SECONDS = 60         # dot is green while the last good sync is this recent
 TIMEOUT = 15
+REFRESH_GRACE_SECONDS = 8  # wait this long for Claude Code to refresh the shared
+                           # token before the widget refreshes it itself
 HOVER_ALPHA = 0.95         # opacity when the mouse is over the window
 IDLE_ALPHA = 0.22          # idle opacity when floating over the desktop
 DOCK_IDLE_ALPHA = 0.6      # idle opacity when docked — higher so the dark bar
@@ -101,16 +104,42 @@ DOCK_TO_TASKBAR = True
 # ---------------------------------------------------------------- credentials
 
 
+BACKUP_PATH = CRED_PATH + ".bak"   # last-known-good snapshot (written by us)
+
+
 def _read_creds():
-    with open(CRED_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Load the credentials, falling back to our last-known-good backup if the
+    main file is briefly unreadable (e.g. a sharing violation while Claude Code
+    is mid-replace) or corrupt. The fallback is READ-ONLY — we never restore it
+    over the main file, so we can't clobber a valid update we just lost the race
+    to read."""
+    try:
+        with open(CRED_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        with open(BACKUP_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def _write_creds(data):
-    """Atomic-ish write so we never corrupt the credentials file."""
-    tmp = CRED_PATH + ".tmp"
+    """Durable, atomic write that can never leave a half-written or clobbered
+    credentials file:
+      - snapshot the current good file to .bak first (recovery point)
+      - write to a PID-unique temp so concurrent writers never share a temp
+      - flush + fsync so a crash/power-loss can't leave a truncated file
+      - os.replace (atomic on Windows) so readers see only the old or new file
+    The widget writes here ONLY as a last resort (see _refresh_token), so this
+    path is rarely hit and never races Claude Code's normal refresh."""
+    try:
+        if os.path.exists(CRED_PATH):
+            shutil.copy2(CRED_PATH, BACKUP_PATH)
+    except OSError:
+        pass                       # backup is best-effort, never block the write
+    tmp = f"{CRED_PATH}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, CRED_PATH)
 
 
@@ -122,11 +151,50 @@ def _expires_at_ms(oauth):
     return v if v > 1_000_000_000_000 else v * 1000
 
 
-def _refresh_token(oauth):
-    """Exchange the refresh token for a new access token and persist it."""
+def _token_from_file():
+    """Return (accessToken, expiresAt_ms) from disk, or (None, 0) on any error."""
+    try:
+        o = _read_creds()["claudeAiOauth"]
+        return o.get("accessToken"), _expires_at_ms(o)
+    except Exception:
+        return None, 0
+
+
+def _refresh_token(prev_access=None):
+    """Exchange the refresh token for a new access token and persist it.
+
+    Race-aware + defers to Claude Code: the widget shares ONE rotating refresh
+    token with Claude Code, and rotating it invalidates the old one. Claude Code
+    is the *primary* refresher, so we let it win:
+      1. if the disk already holds a fresh, different access token, use it;
+      2. otherwise wait a short, PID-staggered grace period and re-check — this
+         lets Claude Code's refresh land first and avoids two widget polls hitting
+         the endpoint in lockstep;
+      3. only if nobody refreshed it do we refresh ourselves (last resort).
+    This makes the original 403 (both refreshing at once, loser fails) essentially
+    impossible in normal use, where Claude Code keeps the token fresh."""
+    def _fresh_disk_token():
+        a, exp = _token_from_file()
+        if a and a != prev_access and exp - int(time.time() * 1000) > 120_000:
+            return a
+        return None
+
+    hit = _fresh_disk_token()
+    if hit:
+        return hit                    # (1) someone already refreshed -> no race
+    # (2) give Claude Code a head start (runs on a worker thread, never the UI),
+    # staggered by PID so concurrent instances don't re-check in lockstep
+    time.sleep(REFRESH_GRACE_SECONDS + (os.getpid() % 5))
+    hit = _fresh_disk_token()
+    if hit:
+        return hit
+
+    # (3) last resort: token still stale and nobody fixed it (Claude Code likely
+    # not running) -> refresh ourselves, reading the latest refresh token from disk
+    o = _read_creds()["claudeAiOauth"]
     body = json.dumps({
         "grant_type": "refresh_token",
-        "refresh_token": oauth["refreshToken"],
+        "refresh_token": o["refreshToken"],   # latest token from disk
         "client_id": CLIENT_ID,
     }).encode()
     req = urllib.request.Request(
@@ -148,18 +216,14 @@ def _refresh_token(oauth):
 
 
 def _get_access_token():
-    """Return a valid access token, refreshing it if it is about to expire."""
-    data = _read_creds()
-    oauth = data["claudeAiOauth"]
-    exp = _expires_at_ms(oauth)
-    # only pre-emptively refresh when we actually know the expiry and it's close,
-    # otherwise we'd hammer the token endpoint every poll
-    if exp > 0 and exp - int(time.time() * 1000) < 120_000:
-        try:
-            return _refresh_token(oauth)
-        except Exception:
-            pass
-    return oauth["accessToken"]
+    """Return the on-disk access token without proactively refreshing.
+
+    Claude Code owns the token lifecycle and refreshes it before expiry, so the
+    widget just reads. If the token is nonetheless stale, the usage call returns
+    401/403 and fetch_usage() refreshes reactively — and only as a last resort
+    (see _refresh_token). Not refreshing here removes the pre-emptive refresh that
+    used to race Claude Code around expiry."""
+    return _read_creds()["claudeAiOauth"]["accessToken"]
 
 
 class RateLimited(Exception):
@@ -192,7 +256,17 @@ def fetch_usage():
         data = _fetch_usage_once(token)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            token = _refresh_token(_read_creds()["claudeAiOauth"])
+            try:
+                token = _refresh_token(prev_access=token)
+            except Exception:
+                # our own refresh failed (e.g. Claude Code already rotated the
+                # shared refresh token). Re-read the file once — Claude Code may
+                # have just written a fresh token — and try that before giving up,
+                # so we recover in this same poll instead of waiting out a backoff.
+                disk_access, _ = _token_from_file()
+                if not disk_access or disk_access == token:
+                    raise
+                token = disk_access
             data = _fetch_usage_once(token)
         elif e.code == 429:
             ra = e.headers.get("Retry-After") if e.headers else None
