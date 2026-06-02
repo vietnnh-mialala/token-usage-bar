@@ -1,12 +1,12 @@
-PackageIdentifier: polaproject.TokenUsageBar
-PackageVersion: 1.0.0
+PackageIdentifier: vietnnh-mialala.TokenUsageBar
+PackageVersion: 1.0.2
 PackageLocale: en-US
-Publisher: polaproject
-PublisherUrl: https://github.com/polaproject
+Publisher: vietnnh-mialala
+PublisherUrl: https://github.com/vietnnh-mialala
 PackageName: Token Usage Bar
-PackageUrl: https://github.com/polaproject/token-usage-bar
+PackageUrl: https://github.com/vietnnh-mialala/token-usage-bar
 License: MIT
-LicenseUrl: https://github.com/polaproject/token-usage-bar/blob/main/LICENSE
+LicenseUrl: https://github.com/vietnnh-mialala/token-usage-bar/blob/main/LICENSE
 ShortDescription: A tiny taskbar bar showing your Claude usage limits (unofficial).
 Description: |-
   Token Usage Bar is a tiny always-on-top widget that shows how much of your

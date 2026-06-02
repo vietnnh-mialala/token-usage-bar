@@ -1,7 +1,7 @@
 # winget manifests
 
-Lets people install with `winget install polaproject.TokenUsageBar` and update
-with `winget upgrade`.
+Lets people install with `winget install vietnnh-mialala.TokenUsageBar` and
+update with `winget upgrade`.
 
 ## Publishing a version
 1. Create the GitHub release `vX.Y.Z` with `TokenUsageBar.exe` attached
@@ -13,7 +13,7 @@ with `winget upgrade`.
 4. Validate locally:  `winget validate .\winget`
    and (optional) `winget install --manifest .\winget`.
 5. Submit the three files to <https://github.com/microsoft/winget-pkgs> under
-   `manifests/p/polaproject/TokenUsageBar/X.Y.Z/` (a PR; CI there auto-checks).
+   `manifests/v/vietnnh-mialala/TokenUsageBar/X.Y.Z/` (a PR; CI there auto-checks).
 
 > First publish requires your `Publisher`/`PackageIdentifier` to pass winget's
 > review once; later versions are mostly automated.
