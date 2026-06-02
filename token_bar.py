@@ -46,7 +46,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -681,10 +681,18 @@ class TokenBar:
 
     # ---- update check (GitHub Releases) -----------------------------------
     def _open_releases(self):
+        # Open the releases page in the default browser. Use os.startfile
+        # (ShellExecute) first: webbrowser.open() can hard-crash a --noconsole
+        # PyInstaller build (native abort 0xc0000409 in ucrtbase, which a Python
+        # try/except cannot catch), taking the whole widget down.
+        url = f"https://github.com/{REPO}/releases/latest"
         try:
-            webbrowser.open(f"https://github.com/{REPO}/releases/latest")
+            os.startfile(url)              # Windows-native, safe in no-console builds
         except Exception:
-            pass
+            try:
+                webbrowser.open(url)       # fallback for non-Windows / odd setups
+            except Exception:
+                pass
 
     def _check_update(self):
         """Ask GitHub for the latest release tag in a background thread."""
