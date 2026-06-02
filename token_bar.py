@@ -46,7 +46,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
