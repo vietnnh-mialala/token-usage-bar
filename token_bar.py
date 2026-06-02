@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -203,8 +203,15 @@ def _refresh_token(prev_access=None):
         TOKEN_URL, data=body, method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        tok = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            tok = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # the token endpoint rejecting the grant means the refresh token itself
+        # is dead (revoked / rotated away) -> a fresh sign-in is the only fix
+        if e.code in (400, 401, 403):
+            raise NeedsLogin() from e
+        raise
 
     data = _read_creds()
     o = data["claudeAiOauth"]
@@ -233,6 +240,11 @@ class RateLimited(Exception):
     def __init__(self, retry_after):
         super().__init__("rate limited")
         self.retry_after = retry_after
+
+
+class NeedsLogin(Exception):
+    """Raised when the stored refresh token is no longer valid, so the only way
+    forward is a fresh sign-in (the widget cannot do OAuth itself)."""
 
 
 def _friendly_error(e):
@@ -345,6 +357,7 @@ BAR_BG = "#1b2334"    # bar track
 DOT_LIVE = "#21e6c1"  # green-teal: synced within FRESH_SECONDS
 DOT_WARN = "#ffb020"  # amber: no successful sync for over FRESH_SECONDS
 DOT_IDLE = SUB        # grey: not synced yet (startup)
+DOT_ERR  = "#ff5466"  # red: sign-in needed (refresh token dead) -> action required
 
 
 def bar_color(pct):
@@ -510,6 +523,7 @@ class TokenBar:
         self._tray_pct = None     # last (fh,sd) drawn into the tray icon
         self._last_ok = None      # time.monotonic() of the last successful sync
         self._dot_color = None    # current dot fill (avoid redundant redraws)
+        self._needs_login = False  # True when the refresh token is dead (sign in)
         self._docked = False      # True while overlaying the taskbar
         self._dock_screen_y = 0   # screen y (centred in the taskbar band) when docked
         self._update_ver = None   # set when a newer release is found on GitHub
@@ -606,6 +620,8 @@ class TokenBar:
         self.menu.add_checkbutton(
             label="Start with Windows", variable=self._autostart_var,
             command=lambda: self._set_autostart(self._autostart_var.get()))
+        self.menu.add_command(label="🔑 Sign in to Claude…",
+                              command=self._sign_in)
         self.menu.add_command(label="Check for updates…",
                               command=self._open_releases)
         self.menu.add_separator()
@@ -874,9 +890,10 @@ class TokenBar:
             self.root.after(0, self._on_success, fh, sd, reset)
         except RateLimited as e:
             self.root.after(0, self._on_rate_limit, e.retry_after)
+        except NeedsLogin:
+            self.root.after(0, self._on_needs_login)
         except FileNotFoundError:
-            self.root.after(0, self._on_error,
-                            "sign in to Claude Code first", SLOW_SECONDS)
+            self.root.after(0, self._on_needs_login)   # no creds file -> sign in
         except Exception as e:
             self.root.after(0, self._on_error, _friendly_error(e), SLOW_SECONDS)
 
@@ -909,6 +926,39 @@ class TokenBar:
         self._error(msg)
         self._schedule_next(wait)
 
+    def _on_needs_login(self):
+        """Refresh token is dead -> make it loud and one-click to fix."""
+        first = not self._needs_login
+        self._needs_login = True
+        self._update_dot()                 # dot -> red
+        self._update_reset_label()         # countdown -> "⚠ sign in"
+        if self.icon is not None:
+            try:
+                self.icon.title = (f"{APP_NAME} — sign in needed "
+                                   f"(right-click ▸ Sign in to Claude)")
+                if first:                  # toast once per transition, not every poll
+                    self.icon.notify(
+                        "Sign-in expired. Right-click the bar → "
+                        "Sign in to Claude.", APP_NAME)
+            except Exception:
+                pass
+        # keep polling so we recover automatically once the user signs in
+        self._schedule_next(60)
+
+    def _sign_in(self):
+        """Open Claude's sign-in flow in a console window (claude auth login).
+        The widget can't do OAuth itself, but it can launch the real flow so the
+        user never has to know the command."""
+        claude = (shutil.which("claude")
+                  or os.path.join(HOME, ".local", "bin", "claude.exe"))
+        try:
+            # a fresh console window keeps the browser-OAuth prompt/result visible
+            subprocess.Popen(["cmd", "/c", "start", "",
+                              "cmd", "/k", claude, "auth", "login"],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            self._open_releases()          # last-ditch: point them at the page
+
     def _on_locked(self):
         # workstation locked -> pause network calls, re-probe every 60s
         self._update_dot()
@@ -935,6 +985,7 @@ class TokenBar:
             canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=c, width=0)
 
     def _render(self, fh, sd, reset):
+        self._needs_login = False          # a good sync clears the sign-in state
         self._last = (fh, sd)
         for key, pct in (("5h", fh), ("7d", sd)):
             val, canvas = self.rows[key]
@@ -967,7 +1018,11 @@ class TokenBar:
 
     # ---- 5h-reset countdown (local, network-independent)
     def _update_reset_label(self):
-        self.reset_lbl.config(text="⟳ " + _reset_compact(self._reset_iso))
+        if self._needs_login:
+            self.reset_lbl.config(text="⚠ sign in", fg=DOT_ERR)
+        else:
+            self.reset_lbl.config(text="⟳ " + _reset_compact(self._reset_iso),
+                                  fg=FG)
 
     # ---- 1 s heartbeat: countdown + sync freshness + topmost recovery
     def _tick_clock(self):
@@ -979,7 +1034,9 @@ class TokenBar:
 
     # ---- status dot: green while synced within FRESH_SECONDS, else amber
     def _update_dot(self):
-        if self._last_ok is None:
+        if self._needs_login:
+            color = DOT_ERR         # red: sign-in required (overrides freshness)
+        elif self._last_ok is None:
             color = DOT_IDLE        # grey until the very first sync lands
         elif time.monotonic() - self._last_ok < FRESH_SECONDS:
             color = DOT_LIVE
@@ -1156,6 +1213,7 @@ def main():
         pystray.MenuItem("Start with Windows",
                          lambda: app._set_autostart(not app._autostart_enabled()),
                          checked=lambda item: app._autostart_enabled()),
+        pystray.MenuItem("Sign in to Claude…", lambda: app._sign_in()),
         pystray.MenuItem("Check for updates…", lambda: app._open_releases()),
         pystray.MenuItem("Quit", lambda: root.after(0, app.quit)),
     )
