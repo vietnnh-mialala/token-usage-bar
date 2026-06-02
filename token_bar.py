@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -783,8 +783,19 @@ class TokenBar:
             os.replace(new_tmp, cur)
             # 4. relaunch the new exe (it waits for us to exit via --updated),
             #    then quit this instance
+            # A PyInstaller --onefile process exports _PYI_PARENT_PROCESS_LEVEL /
+            # _PYI_APPLICATION_HOME_DIR / _PYI_ARCHIVE_FILE (and on older
+            # versions _MEIPASS2 / TCL_LIBRARY). A spawned child inherits them,
+            # so its bootloader REUSES our about-to-be-deleted _MEI dir instead
+            # of extracting its own -> "Can't find a usable init.tcl" crash.
+            # Strip every PyInstaller/Tcl marker so the new exe starts clean.
+            env = os.environ.copy()
+            for k in list(env):
+                if (k.startswith("_PYI") or k.startswith("_MEIPASS")
+                        or k in ("TCL_LIBRARY", "TK_LIBRARY", "TKPATH")):
+                    del env[k]
             subprocess.Popen(
-                [cur, "--updated"],
+                [cur, "--updated"], env=env,
                 creationflags=(getattr(subprocess, "DETACHED_PROCESS", 0)
                                | getattr(subprocess, "CREATE_NO_WINDOW", 0)),
                 close_fds=True)
