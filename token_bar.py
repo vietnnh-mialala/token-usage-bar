@@ -46,8 +46,8 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.1"
-REPO = "polaproject/token-usage-bar"   # GitHub owner/repo for update checks
+VERSION = "1.0.2"
+REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
 # Where to persist the saved window position. As a script that's next to the
