@@ -29,14 +29,20 @@ The tray icon tooltip shows the same numbers (and any error message).
 ## Install (packaged, recommended)
 No Python needed — a self-contained `TokenUsageBar.exe` is provided.
 
-1. Right-click **`install.ps1`** → **Run with PowerShell**
-   (or: `powershell -ExecutionPolicy Bypass -File install.ps1`).
+1. Unzip the download, then **double-click `Install.cmd`**.
 
 It copies the exe to `%LOCALAPPDATA%\TokenUsageBar`, enables **start-at-login**
 (HKCU `Run` key), and starts it now. No admin rights required. You can toggle
 start-at-login any time from the right-click menu → **Start with Windows**.
 
-To remove it later, run **`uninstall.ps1`** the same way.
+To remove it later, **double-click `Uninstall.cmd`**.
+
+> **Why `Install.cmd` and not the `.ps1` directly?** Windows' default execution
+> policy (`RemoteSigned`) refuses to run a `.ps1` that was downloaded/unzipped —
+> right-clicking → *Run with PowerShell* just flashes a window and does nothing.
+> `Install.cmd` launches the same script with `-ExecutionPolicy Bypass`, which
+> works. You can still run `powershell -ExecutionPolicy Bypass -File install.ps1`
+> by hand if you prefer.
 
 > The exe reads your Claude OAuth token from `~/.claude/.credentials.json`, so
 > Claude Code must have been signed in on this machine at least once.
