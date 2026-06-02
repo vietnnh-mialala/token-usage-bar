@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -956,19 +956,48 @@ class TokenBar:
         # keep polling so we recover automatically once the user signs in
         self._schedule_next(60)
 
+    def _find_claude_cli(self):
+        """Locate the Claude Code CLI, or None. shutil.which alone is unreliable
+        for a detached GUI process whose PATH may differ, so also probe the usual
+        per-user install locations."""
+        p = shutil.which("claude")
+        if p and os.path.exists(p):
+            return p
+        appdata = os.environ.get("APPDATA", "")
+        local = os.environ.get("LOCALAPPDATA", "")
+        for cand in (os.path.join(HOME, ".local", "bin", "claude.exe"),
+                     os.path.join(appdata, "npm", "claude.cmd") if appdata else "",
+                     os.path.join(local, "Programs", "claude", "claude.exe") if local else ""):
+            if cand and os.path.exists(cand):
+                return cand
+        return None
+
     def _sign_in(self):
-        """Open Claude's sign-in flow in a console window (claude auth login).
+        """Open Claude's sign-in flow (claude auth login) in a console window.
         The widget can't do OAuth itself, but it can launch the real flow so the
-        user never has to know the command."""
-        claude = (shutil.which("claude")
-                  or os.path.join(HOME, ".local", "bin", "claude.exe"))
-        try:
-            # a fresh console window keeps the browser-OAuth prompt/result visible
-            subprocess.Popen(["cmd", "/c", "start", "",
-                              "cmd", "/k", claude, "auth", "login"],
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except Exception:
-            self._open_releases()          # last-ditch: point them at the page
+        user never has to know the command. If the Claude Code CLI isn't on this
+        PC, say so clearly instead of letting cmd emit a cryptic 'path not found'."""
+        claude = self._find_claude_cli()
+        if claude:
+            try:
+                subprocess.Popen(["cmd", "/c", "start", "",
+                                  "cmd", "/k", claude, "auth", "login"],
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                return
+            except Exception:
+                pass
+        # CLI missing (or launch failed) -> clear guidance, not a shell error
+        if ctypes is not None and hasattr(ctypes, "windll"):
+            msg = ("Claude Code isn't installed (or wasn't found) on this PC.\n\n"
+                   "Token Usage Bar shows the usage from Claude Code, so install "
+                   "Claude Code and sign in there, then click Refresh.\n\n"
+                   "Open the Claude Code website now?")
+            try:
+                r = ctypes.windll.user32.MessageBoxW(0, msg, APP_NAME, 0x4 | 0x40)
+                if r == 6:                              # IDYES
+                    os.startfile("https://claude.com/product/claude-code")
+            except Exception:
+                pass
 
     def _on_locked(self):
         # workstation locked -> pause network calls, re-probe every 60s
