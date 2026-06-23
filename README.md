@@ -12,6 +12,11 @@ onto the empty left area of the Windows taskbar**; it can also float anywhere.
 > "Claude" is a trademark of Anthropic. This tool only *reads* your local usage
 > meter via the same private endpoint Claude Code uses.
 
+> **macOS:** the app is cross-platform (one codebase, OS-specific bits live in
+> [`platform_backend.py`](platform_backend.py)). On a Mac it floats instead of
+> docking and reads credentials from a file *or* the Keychain. See
+> [MACOS.md](MACOS.md) to run from source or build a `.app`.
+
 ## What it shows
 - **● status dot** — teal when the last sync is fresh (< 60 s), amber when the
   data is going stale, grey before the first sync.

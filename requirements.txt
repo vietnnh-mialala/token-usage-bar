@@ -1,0 +1,6 @@
+# Runtime dependencies for Token Usage Bar.
+# tkinter ships with CPython; the rest are the tray icon.
+pystray>=0.19
+pillow>=10.0
+# PyInstaller is only needed to build a standalone app/exe, not to run from source.
+pyinstaller>=6.0

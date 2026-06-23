@@ -26,41 +26,31 @@ import time
 import threading
 import urllib.request
 import urllib.error
-import webbrowser
 import tkinter as tk
 from tkinter import font as tkfont
-
-try:
-    import ctypes
-except Exception:          # non-Windows / no ctypes -> features degrade gracefully
-    ctypes = None
-
-try:
-    import winreg          # for the "Start with Windows" toggle (HKCU Run key)
-except ImportError:
-    winreg = None
 
 import pystray
 from PIL import Image, ImageDraw
 
+from platform_backend import get_backend
+
 HOME = os.path.expanduser("~")
-CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
 VERSION = "1.0.13"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
+
+# Everything OS-specific (credentials storage, autostart, z-order, dialogs) goes
+# through this backend, so the rest of the file is platform-agnostic.
+BACKEND = get_backend()
+STORE = BACKEND.make_credential_store()
 
 # Where to persist the saved window position. As a script that's next to the
 # source; as a packaged (PyInstaller) exe, __file__ points at a temp extraction
 # dir that's wiped each run, so use a stable per-user folder instead.
 if getattr(sys, "frozen", False):
-    _STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", HOME), APP_SLUG)
-    try:
-        os.makedirs(_STATE_DIR, exist_ok=True)
-    except OSError:
-        _STATE_DIR = HOME
+    _STATE_DIR = BACKEND.state_dir(APP_SLUG)
 else:
     _STATE_DIR = os.path.dirname(os.path.abspath(__file__))
 POS_PATH = os.path.join(_STATE_DIR, ".window_pos.json")
@@ -107,44 +97,18 @@ DOCK_TO_TASKBAR = True
 
 # ---------------------------------------------------------------- credentials
 
-
-BACKUP_PATH = CRED_PATH + ".bak"   # last-known-good snapshot (written by us)
+# Credentials live behind the platform's CredentialStore (a file on Windows; a
+# file or the Keychain on macOS). The widget writes ONLY as a last resort (see
+# _refresh_token), so the store's durable/atomic write path is rarely hit and
+# never races Claude Code's normal refresh.
 
 
 def _read_creds():
-    """Load the credentials, falling back to our last-known-good backup if the
-    main file is briefly unreadable (e.g. a sharing violation while Claude Code
-    is mid-replace) or corrupt. The fallback is READ-ONLY — we never restore it
-    over the main file, so we can't clobber a valid update we just lost the race
-    to read."""
-    try:
-        with open(CRED_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        with open(BACKUP_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+    return STORE.read()
 
 
 def _write_creds(data):
-    """Durable, atomic write that can never leave a half-written or clobbered
-    credentials file:
-      - snapshot the current good file to .bak first (recovery point)
-      - write to a PID-unique temp so concurrent writers never share a temp
-      - flush + fsync so a crash/power-loss can't leave a truncated file
-      - os.replace (atomic on Windows) so readers see only the old or new file
-    The widget writes here ONLY as a last resort (see _refresh_token), so this
-    path is rarely hit and never races Claude Code's normal refresh."""
-    try:
-        if os.path.exists(CRED_PATH):
-            shutil.copy2(CRED_PATH, BACKUP_PATH)
-    except OSError:
-        pass                       # backup is best-effort, never block the write
-    tmp = f"{CRED_PATH}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, CRED_PATH)
+    STORE.write(data)
 
 
 def _expires_at_ms(oauth):
@@ -395,122 +359,6 @@ def make_tray_image(fh, sd):
     return img
 
 
-# ---------------------------------------------------------------- platform
-
-_SINGLE_INSTANCE_MUTEX = None  # kept alive for the whole process lifetime
-
-
-def acquire_single_instance(wait_seconds=0):
-    """Return True if we are the only instance, False if one is already running.
-
-    Uses a named Windows mutex (per-user session). On any platform without
-    ctypes this is a no-op that always returns True.
-
-    wait_seconds > 0 retries until the existing instance exits — used right after
-    a self-update relaunch, where the old exe is still shutting down and would
-    otherwise make the freshly-installed copy think a duplicate is running.
-    """
-    global _SINGLE_INSTANCE_MUTEX
-    if ctypes is None or not hasattr(ctypes, "windll"):
-        return True
-    ERROR_ALREADY_EXISTS = 183
-    k32 = ctypes.windll.kernel32
-    deadline = time.time() + max(0, wait_seconds)
-    while True:
-        mutex = k32.CreateMutexW(None, False, APP_SLUG + "_singleton")
-        if k32.GetLastError() != ERROR_ALREADY_EXISTS:
-            _SINGLE_INSTANCE_MUTEX = mutex
-            return True
-        if mutex:
-            k32.CloseHandle(mutex)         # release the duplicate handle
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.3)
-
-
-def is_session_locked():
-    """True when the workstation is locked (secure desktop is active).
-
-    When locked, the user process can no longer open the *input* desktop, so
-    OpenInputDesktop fails - a reliable, notification-free lock probe.
-    """
-    if ctypes is None or not hasattr(ctypes, "windll"):
-        return False
-    try:
-        DESKTOP_READOBJECTS = 0x0001
-        user32 = ctypes.windll.user32
-        h = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
-        if not h:
-            return True
-        user32.CloseDesktop(h)
-        return False
-    except Exception:
-        return False
-
-
-def enable_dpi_awareness():
-    """Tell Windows we paint at native resolution, so it stops bitmap-stretching
-    (and blurring) the window on a scaled display. Must run before Tk() exists."""
-    if ctypes is None or not hasattr(ctypes, "windll"):
-        return
-    try:
-        # PROCESS_SYSTEM_DPI_AWARE (1) — crisp at the system scale factor
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-
-# SetWindowPos / ShowWindow flags for re-asserting the bar's topmost z-order
-HWND_TOPMOST = -1
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOACTIVATE = 0x0010
-SW_SHOWNA = 8         # show in current state without activating (re-raises z)
-GA_ROOT = 2
-
-
-def assert_topmost(hwnd):
-    """Re-raise the bar above the Windows 11 taskbar, without stealing focus.
-
-    The Win11 taskbar is a DirectComposition surface that, after a shell event
-    (Start menu, a click), can end up painted *over* our topmost overlay — and
-    SetWindowPos(HWND_TOPMOST) does NOT bring it back (verified). ShowWindow with
-    SW_SHOWNA (show, no-activate) re-inserts the window at the top of the z-order
-    and DOES recover it, with no flicker and no focus theft. We then re-stamp the
-    topmost flag so the state stays consistent."""
-    if ctypes is None or not hasattr(ctypes, "windll") or not hwnd:
-        return
-    try:
-        u = ctypes.windll.user32
-        u.ShowWindow(hwnd, SW_SHOWNA)
-        u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-    except Exception:
-        pass
-
-
-def work_area():
-    """Primary-monitor work area (left, top, right, bottom) excluding the
-    taskbar, or None if unavailable. Used to keep the window on-screen."""
-    if ctypes is None or not hasattr(ctypes, "windll"):
-        return None
-    try:
-        class RECT(ctypes.Structure):
-            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-        r = RECT()
-        SPI_GETWORKAREA = 0x0030
-        if ctypes.windll.user32.SystemParametersInfoW(
-                SPI_GETWORKAREA, 0, ctypes.byref(r), 0):
-            return r.left, r.top, r.right, r.bottom
-    except Exception:
-        pass
-    return None
-
-
 # ---------------------------------------------------------------- UI
 
 
@@ -557,11 +405,13 @@ class TokenBar:
         pad = tk.Frame(border, bg=BG, padx=self._s(10), pady=self._s(6))
         pad.pack(fill="both", expand=True)
 
-        # one monospace face (Consolas) for everything — the countdown look the
-        # user likes; labels/countdown regular, usage numbers bold for emphasis
-        label_font = tkfont.Font(family="Consolas", size=9)
-        num_font = tkfont.Font(family="Consolas", size=9, weight="bold")
-        count_font = tkfont.Font(family="Consolas", size=9)
+        # one monospace face for everything — the countdown look the user likes;
+        # labels/countdown regular, usage numbers bold for emphasis. The family is
+        # platform-chosen (Consolas on Windows, Menlo on macOS, else Tk's default).
+        mono = BACKEND.mono_font
+        label_font = tkfont.Font(family=mono, size=9)
+        num_font = tkfont.Font(family=mono, size=9, weight="bold")
+        count_font = tkfont.Font(family=mono, size=9)
         # one common line height -> every element is this tall and pack() centres
         # them all on the same line (fixes the "some high, some low" stagger)
         self._line_h = num_font.metrics("linespace")
@@ -616,12 +466,13 @@ class TokenBar:
         self.menu.add_command(label=f"{APP_NAME} v{VERSION}", state="disabled")
         self.menu.add_separator()
         self.menu.add_command(label="Refresh now", command=self.refresh_async)
-        self.menu.add_command(label="Dock / Undock taskbar",
-                              command=self.toggle_dock)
+        if BACKEND.supports_dock:        # taskbar overlay is a Windows-only concept
+            self.menu.add_command(label="Dock / Undock taskbar",
+                                  command=self.toggle_dock)
         self.menu.add_command(label="Hide to tray", command=self.hide)
         self._autostart_var = tk.BooleanVar(value=self._autostart_enabled())
         self.menu.add_checkbutton(
-            label="Start with Windows", variable=self._autostart_var,
+            label=BACKEND.autostart_label, variable=self._autostart_var,
             command=lambda: self._set_autostart(self._autostart_var.get()))
         self.menu.add_command(label="🔑 Sign in to Claude…",
                               command=self._sign_in)
@@ -640,11 +491,12 @@ class TokenBar:
         self._reset_iso = None      # last known 5h reset time (absolute)
         self.root.update_idletasks()
         self._clamp_pos()           # never restore off-screen / behind taskbar
-        if DOCK_TO_TASKBAR:
+        self._dock_enabled = DOCK_TO_TASKBAR and BACKEND.supports_dock
+        if self._dock_enabled:
             # defer until the window is fully realized/mapped before positioning
             self.root.after(200, self._dock)
         # first run of the packaged exe -> default to launching at login
-        if getattr(sys, "frozen", False) and winreg is not None:
+        if getattr(sys, "frozen", False):
             marker = os.path.join(_STATE_DIR, ".autostart_init")
             if not os.path.exists(marker):
                 self._set_autostart(True)
@@ -665,13 +517,7 @@ class TokenBar:
 
     def _hwnd(self):
         """Native top-level window handle, or None off-Windows / before map."""
-        if ctypes is None or not hasattr(ctypes, "windll"):
-            return None
-        try:
-            h = self.root.winfo_id()
-            return ctypes.windll.user32.GetAncestor(h, GA_ROOT) or h
-        except Exception:
-            return None
+        return BACKEND.root_hwnd(self.root)
 
     # ---- dock onto the taskbar (topmost overlay over its empty area) ------
     # NB: re-parenting into Shell_TrayWnd is *invisible* on Windows 11 — the
@@ -682,7 +528,7 @@ class TokenBar:
     def _taskbar_band(self):
         """(top, height) in screen px of the taskbar strip below the work area,
         or None if it can't be determined."""
-        wa = work_area()
+        wa = BACKEND.work_area(self.root)
         if not wa:
             return None
         top = wa[3]                       # work-area bottom == top of the taskbar
@@ -706,7 +552,7 @@ class TokenBar:
         except tk.TclError:
             pass
         self.root.geometry(f"+{int(self._dock_x)}+{int(self._dock_screen_y)}")
-        assert_topmost(self._hwnd())
+        BACKEND.assert_topmost(self._hwnd())
 
     def _undock(self):
         """Return to a floating topmost window above the taskbar."""
@@ -718,32 +564,27 @@ class TokenBar:
         self.root.geometry(f"+{self._fx}+{self._fy}")
         self.root.update_idletasks()
         self._clamp_pos()
-        assert_topmost(self._hwnd())
+        BACKEND.assert_topmost(self._hwnd())
 
     def toggle_dock(self):
+        if not getattr(self, "_dock_enabled", False):
+            return                         # no taskbar to dock onto (non-Windows)
         self.root.after(0, self._undock if self._docked else self._dock)
 
     # ---- update check (GitHub Releases) -----------------------------------
     def _open_releases(self):
-        # Open the releases page in the default browser. Use os.startfile
-        # (ShellExecute) first: webbrowser.open() can hard-crash a --noconsole
-        # PyInstaller build (native abort 0xc0000409 in ucrtbase, which a Python
-        # try/except cannot catch), taking the whole widget down.
-        url = f"https://github.com/{REPO}/releases/latest"
-        try:
-            os.startfile(url)              # Windows-native, safe in no-console builds
-        except Exception:
-            try:
-                webbrowser.open(url)       # fallback for non-Windows / odd setups
-            except Exception:
-                pass
+        # Open the releases page in the default browser (the backend picks the
+        # safe per-OS opener — e.g. os.startfile on Windows, `open` on macOS).
+        BACKEND.open_url(f"https://github.com/{REPO}/releases/latest")
 
     # ---- one-click self-update (download + verify + swap + relaunch) ------
     def _do_update(self):
         """Triggered by the 'Update available' link. Download the newer exe and
         swap it in. Falls back to just opening the page when not runnable as a
-        self-update (running from source, or no known newer version)."""
-        if not getattr(sys, "frozen", False) or not self._update_ver:
+        self-update (running from source, no newer version, or a platform without
+        in-place exe self-update such as macOS)."""
+        if (not getattr(sys, "frozen", False) or not self._update_ver
+                or not BACKEND.supports_self_update):
             self._open_releases()
             return
         if getattr(self, "_updating", False):
@@ -855,38 +696,19 @@ class TokenBar:
             except Exception:
                 pass
 
-    # ---- start with Windows (HKCU Run key, no admin needed) ---------------
-    def _autostart_target(self):
-        if getattr(sys, "frozen", False):
-            return f'"{sys.executable}"'                    # the packaged exe
-        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        return f'"{pyw}" "{os.path.abspath(__file__)}"'     # source mode
-
+    # ---- launch at login (HKCU Run key on Windows, LaunchAgent on macOS) ----
     def _autostart_enabled(self):
-        if winreg is None:
-            return False
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-                winreg.QueryValueEx(k, APP_SLUG)
-            return True
-        except OSError:
-            return False
+        return BACKEND.autostart_enabled(APP_SLUG)
 
     def _set_autostart(self, on):
-        if winreg is None:
-            return
+        # __file__ is only meaningful in source mode; the backend ignores it for
+        # frozen builds (which launch sys.executable directly).
         try:
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-                if on:
-                    winreg.SetValueEx(k, APP_SLUG, 0, winreg.REG_SZ,
-                                      self._autostart_target())
-                else:
-                    try:
-                        winreg.DeleteValue(k, APP_SLUG)
-                    except FileNotFoundError:
-                        pass
-        except OSError:
-            pass
+            script_path = os.path.abspath(__file__)
+        except NameError:
+            script_path = None
+        BACKEND.set_autostart(APP_SLUG, on, script_path=script_path,
+                              app_name=APP_NAME)
         if hasattr(self, "_autostart_var"):
             self._autostart_var.set(self._autostart_enabled())
 
@@ -901,7 +723,7 @@ class TokenBar:
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
-        if is_session_locked():
+        if BACKEND.is_session_locked():
             self.root.after(0, self._on_locked)
             return
         try:
@@ -951,8 +773,8 @@ class TokenBar:
         but the token is dead)."""
         first = not self._needs_login
         self._needs_login = True
-        # setup = no creds file AND no CLI -> the widget can't work here yet
-        self._setup_mode = (not os.path.exists(CRED_PATH)
+        # setup = no creds anywhere AND no CLI -> the widget can't work here yet
+        self._setup_mode = (not STORE.exists()
                             and self._find_claude_cli() is None)
         self._update_dot()                 # dot -> red
         self._update_reset_label()         # countdown -> "⚠ setup" / "⚠ sign in"
@@ -984,47 +806,25 @@ class TokenBar:
         self._schedule_next(60)
 
     def _find_claude_cli(self):
-        """Locate the Claude Code CLI, or None. shutil.which alone is unreliable
-        for a detached GUI process whose PATH may differ, so also probe the usual
-        per-user install locations."""
-        p = shutil.which("claude")
-        if p and os.path.exists(p):
-            return p
-        appdata = os.environ.get("APPDATA", "")
-        local = os.environ.get("LOCALAPPDATA", "")
-        for cand in (os.path.join(HOME, ".local", "bin", "claude.exe"),
-                     os.path.join(appdata, "npm", "claude.cmd") if appdata else "",
-                     os.path.join(local, "Programs", "claude", "claude.exe") if local else ""):
-            if cand and os.path.exists(cand):
-                return cand
-        return None
+        """Locate the Claude Code CLI, or None. Probing the usual per-user install
+        locations is delegated to the platform backend (paths differ per OS)."""
+        return BACKEND.find_claude_cli()
 
     def _sign_in(self):
-        """Open Claude's sign-in flow (claude auth login) in a console window.
-        The widget can't do OAuth itself, but it can launch the real flow so the
-        user never has to know the command. If the Claude Code CLI isn't on this
-        PC, say so clearly instead of letting cmd emit a cryptic 'path not found'."""
+        """Open Claude's sign-in flow (claude auth login) in a terminal. The
+        widget can't do OAuth itself, but it can launch the real flow so the user
+        never has to know the command. If the Claude Code CLI isn't on this
+        machine, say so clearly instead of emitting a cryptic shell error."""
         claude = self._find_claude_cli()
-        if claude:
-            try:
-                subprocess.Popen(["cmd", "/c", "start", "",
-                                  "cmd", "/k", claude, "auth", "login"],
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                return
-            except Exception:
-                pass
+        if claude and BACKEND.launch_sign_in(claude):
+            return
         # CLI missing (or launch failed) -> clear guidance, not a shell error
-        if ctypes is not None and hasattr(ctypes, "windll"):
-            msg = ("Claude Code isn't installed (or wasn't found) on this PC.\n\n"
-                   "Token Usage Bar shows the usage from Claude Code, so install "
-                   "Claude Code and sign in there, then click Refresh.\n\n"
-                   "Open the Claude Code website now?")
-            try:
-                r = ctypes.windll.user32.MessageBoxW(0, msg, APP_NAME, 0x4 | 0x40)
-                if r == 6:                              # IDYES
-                    os.startfile("https://claude.com/product/claude-code")
-            except Exception:
-                pass
+        msg = ("Claude Code isn't installed (or wasn't found) on this machine.\n\n"
+               "Token Usage Bar shows the usage from Claude Code, so install "
+               "Claude Code and sign in there, then click Refresh.\n\n"
+               "Open the Claude Code website now?")
+        if BACKEND.confirm(APP_NAME, msg):
+            BACKEND.open_url("https://claude.com/product/claude-code")
 
     def _on_locked(self):
         # workstation locked -> pause network calls, re-probe every 60s
@@ -1104,7 +904,7 @@ class TokenBar:
         self._update_reset_label()      # the 5h countdown ticks every second
         self._update_dot()              # re-evaluate sync freshness
         if not self.hidden:
-            assert_topmost(self._hwnd())   # recover fast if the shell covers us
+            BACKEND.assert_topmost(self._hwnd())  # recover if the shell covers us
         self.root.after(1000, self._tick_clock)
 
     # ---- status dot: green while synced within FRESH_SECONDS, else amber
@@ -1204,7 +1004,7 @@ class TokenBar:
             w = max(self.root.winfo_width(), self.root.winfo_reqwidth())
             h = max(self.root.winfo_height(), self.root.winfo_reqheight())
             x, y = self.root.winfo_x(), self.root.winfo_y()
-            wa = work_area()
+            wa = BACKEND.work_area(self.root)
             if wa:
                 left, top, right, bottom = wa
             else:
@@ -1255,19 +1055,13 @@ def _cleanup_after_update():
 
 
 def main():
-    enable_dpi_awareness()         # crisp text on scaled (125% etc) displays
+    BACKEND.enable_hidpi()         # crisp text on scaled (125% etc) displays
     # after a self-update relaunch (--updated) the old copy is still shutting
-    # down, so wait briefly for its single-instance mutex to free up
+    # down, so wait briefly for its single-instance lock to free up
     updated = "--updated" in sys.argv
-    if not acquire_single_instance(8 if updated else 0):
+    if not BACKEND.acquire_single_instance(APP_SLUG, 8 if updated else 0):
         # another copy is already running -> don't add load on the API
-        try:
-            if ctypes and hasattr(ctypes, "windll"):
-                ctypes.windll.user32.MessageBoxW(
-                    0, f"{APP_NAME} is already running.",
-                    APP_NAME, 0x40)
-        except Exception:
-            pass
+        BACKEND.alert(APP_NAME, f"{APP_NAME} is already running.")
         sys.exit(0)
 
     if updated:
@@ -1278,20 +1072,25 @@ def main():
     app = TokenBar(root)
 
     # tray icon (runs its own message loop in a background thread)
-    menu = pystray.Menu(
+    items = [
         pystray.MenuItem(f"{APP_NAME} v{VERSION}", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Show / Hide", lambda: app.toggle(), default=True),
         pystray.MenuItem("Refresh now",
                          lambda: root.after(0, app.refresh_async)),
-        pystray.MenuItem("Dock / Undock taskbar", lambda: app.toggle_dock()),
-        pystray.MenuItem("Start with Windows",
+    ]
+    if BACKEND.supports_dock:
+        items.append(pystray.MenuItem("Dock / Undock taskbar",
+                                      lambda: app.toggle_dock()))
+    items += [
+        pystray.MenuItem(BACKEND.autostart_label,
                          lambda: app._set_autostart(not app._autostart_enabled()),
                          checked=lambda item: app._autostart_enabled()),
         pystray.MenuItem("Sign in to Claude…", lambda: app._sign_in()),
         pystray.MenuItem("Check for updates…", lambda: app._open_releases()),
         pystray.MenuItem("Quit", lambda: root.after(0, app.quit)),
-    )
+    ]
+    menu = pystray.Menu(*items)
     icon = pystray.Icon("token_usage_bar", make_tray_image(0, 0),
                         APP_NAME, menu)
     app.icon = icon
