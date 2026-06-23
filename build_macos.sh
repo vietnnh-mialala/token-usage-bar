@@ -12,12 +12,6 @@ cd "$(dirname "$0")"
 
 APP_NAME="TokenUsageBar"
 
-# A .icns icon is optional; if you have one named icon.icns it gets embedded.
-ICON_ARG=()
-if [[ -f icon.icns ]]; then
-  ICON_ARG=(--icon icon.icns)
-fi
-
 echo "==> Checking tkinter is available…"
 python3 -c "import tkinter; print('tkinter', tkinter.TkVersion)" || {
   echo "ERROR: tkinter not available. On Homebrew run: brew install python-tk" >&2
@@ -28,14 +22,22 @@ echo "==> Installing dependencies…"
 python3 -m pip install --upgrade -r requirements.txt
 
 echo "==> Building ${APP_NAME}.app…"
-python3 -m PyInstaller \
-  --noconfirm \
-  --clean \
-  --windowed \
-  --name "${APP_NAME}" \
-  --osx-bundle-identifier "com.tokenusagebar" \
-  "${ICON_ARG[@]}" \
-  token_bar.py
+# A .icns icon is optional; embed it only if present. (Two branches instead of
+# an array expansion so this stays safe under `set -u` on macOS's bash 3.2.)
+if [[ -f icon.icns ]]; then
+  python3 -m PyInstaller \
+    --noconfirm --clean --windowed \
+    --name "${APP_NAME}" \
+    --osx-bundle-identifier "com.tokenusagebar" \
+    --icon icon.icns \
+    token_bar.py
+else
+  python3 -m PyInstaller \
+    --noconfirm --clean --windowed \
+    --name "${APP_NAME}" \
+    --osx-bundle-identifier "com.tokenusagebar" \
+    token_bar.py
+fi
 
 echo
 echo "==> Done. Bundle at: dist/${APP_NAME}.app"
