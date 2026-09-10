@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.13"
+VERSION = "1.0.14"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -93,7 +93,13 @@ FRESH_SECONDS = 60         # dot is green while the last good sync is this recen
 TIMEOUT = 15
 UPDATE_CHECK_SECONDS = 6 * 3600   # re-check GitHub for a newer release this often
                                   # (so long-running instances notice updates too)
-REFRESH_GRACE_SECONDS = 8  # wait this long for Claude Code to refresh the shared
+REFRESH_GRACE_SECONDS = 8
+
+# A refused refresh is NOT proof the session ended: the refresh token is
+# single-use and shared with Claude Code, so losing a rotation race looks
+# exactly like a revoked token. Corroborate before crying "sign in".
+AUTH_CONFIRM_TRIES = 3        # consecutive refusals needed...
+AUTH_CONFIRM_SECONDS = 300    # ...spanning at least this long (s)  # wait this long for Claude Code to refresh the shared
                            # token before the widget refreshes it itself
 HOVER_ALPHA = 0.95         # opacity when the mouse is over the window
 IDLE_ALPHA = 0.22          # idle opacity when floating over the desktop
@@ -164,6 +170,18 @@ def _token_from_file():
         return None, 0
 
 
+def _refresh_fingerprint():
+    """A short, one-way fingerprint of the refresh token on disk.
+
+    Lets us answer "has anyone rotated the credentials since the last failure?"
+    without ever keeping the token itself around. Empty string when unreadable."""
+    try:
+        rt = _read_creds()["claudeAiOauth"].get("refreshToken") or ""
+    except Exception:
+        return ""
+    return hashlib.sha256(rt.encode()).hexdigest()[:12] if rt else ""
+
+
 def _refresh_token(prev_access=None):
     """Exchange the refresh token for a new access token and persist it.
 
@@ -209,10 +227,23 @@ def _refresh_token(prev_access=None):
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             tok = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        # the token endpoint rejecting the grant means the refresh token itself
-        # is dead (revoked / rotated away) -> a fresh sign-in is the only fix
+        # A refused grant reads as "dead token" but usually is not: the refresh
+        # token is single-use, so if Claude Code spent this one between our read
+        # and the server's check, our copy is one generation behind and the
+        # endpoint answers invalid_grant — same response as a truly revoked
+        # token. Anything that is NOT invalid_grant is a plain API error, and
+        # invalid_grant itself only starts the evidence trail: the caller
+        # corroborates it across polls (see TokenBar._on_auth_failure) before
+        # any sign-in prompt reaches the user.
         if e.code in (400, 401, 403):
-            raise NeedsLogin() from e
+            err = ""
+            try:
+                err = (json.loads(e.read()) or {}).get("error", "")
+            except Exception:
+                pass
+            if err and err != "invalid_grant":
+                raise
+            raise NeedsLogin(_refresh_fingerprint(), err or f"HTTP {e.code}") from e
         raise
 
     data = _read_creds()
@@ -229,11 +260,13 @@ def _refresh_token(prev_access=None):
 def _get_access_token():
     """Return the on-disk access token without proactively refreshing.
 
-    Claude Code owns the token lifecycle and refreshes it before expiry, so the
-    widget just reads. If the token is nonetheless stale, the usage call returns
-    401/403 and fetch_usage() refreshes reactively — and only as a last resort
-    (see _refresh_token). Not refreshing here removes the pre-emptive refresh that
-    used to race Claude Code around expiry."""
+    Claude Code owns the token lifecycle, but it does NOT keep this file fresh:
+    measured on a live machine, the stored token sat 4.5 h past its expiry while
+    Claude Code itself kept working happily from memory. So "expired on disk"
+    says nothing about the session — which is why nothing here (or anywhere)
+    prompts for a sign-in on a clock. We read, let the usage call return 401/403
+    if the token is stale, and refresh reactively in fetch_usage() — only as a
+    last resort (see _refresh_token)."""
     return _read_creds()["claudeAiOauth"]["accessToken"]
 
 
@@ -245,8 +278,16 @@ class RateLimited(Exception):
 
 
 class NeedsLogin(Exception):
-    """Raised when the stored refresh token is no longer valid, so the only way
-    forward is a fresh sign-in (the widget cannot do OAuth itself)."""
+    """Raised when a refresh was refused, i.e. the stored refresh token *may* be
+    dead and a fresh sign-in *may* be the only way forward (the widget cannot do
+    OAuth itself). One of these is a suspicion, not a verdict — `fingerprint`
+    identifies the credentials that were refused so the UI can tell a genuinely
+    dead token (same fingerprint, refused again and again) from a lost rotation
+    race (fingerprint changed = somebody refreshed = we were simply stale)."""
+    def __init__(self, fingerprint="", reason=""):
+        super().__init__(reason or "needs login")
+        self.fingerprint = fingerprint
+        self.reason = reason
 
 
 def _friendly_error(e):
@@ -254,7 +295,8 @@ def _friendly_error(e):
     the tooltip — never the raw 'The read operation timed out' / stack noise."""
     if isinstance(e, urllib.error.HTTPError):
         if e.code in (401, 403):
-            return "sign-in expired — open Claude Code, then Refresh"
+            # stale access token, not a dead session: the refresh path handles it
+            return "token stale — refreshing"
         if e.code == 429:
             return "rate limited — waiting to retry"
         if 500 <= e.code < 600:
@@ -527,6 +569,9 @@ class TokenBar:
         self._dot_color = None    # current dot fill (avoid redundant redraws)
         self._needs_login = False  # True when sign-in / setup is needed
         self._setup_mode = False   # True when Claude Code isn't on this PC at all
+        self._auth_fail_fp = None  # fingerprint of the credentials last refused
+        self._auth_fail_n = 0      # consecutive refusals of that same fingerprint
+        self._auth_fail_since = 0.0  # monotonic clock of the first of them
         self._docked = False      # True while overlaying the taskbar
         self._dock_screen_y = 0   # screen y (centred in the taskbar band) when docked
         self._update_ver = None   # set when a newer release is found on GitHub
@@ -909,8 +954,8 @@ class TokenBar:
             self.root.after(0, self._on_success, fh, sd, reset)
         except RateLimited as e:
             self.root.after(0, self._on_rate_limit, e.retry_after)
-        except NeedsLogin:
-            self.root.after(0, self._on_needs_login)
+        except NeedsLogin as e:
+            self.root.after(0, self._on_auth_failure, e.fingerprint)
         except FileNotFoundError:
             self.root.after(0, self._on_needs_login)   # no creds file -> sign in
         except Exception as e:
@@ -918,6 +963,8 @@ class TokenBar:
 
     def _on_success(self, fh, sd, reset):
         self._backoff = FAST_SECONDS
+        self._auth_fail_n = 0             # a good sync retires any sign-in suspicion
+        self._auth_fail_fp = None
         # adaptive cadence: speed up when the numbers move, slow down when idle
         changed = self._prev is None or (round(fh, 1), round(sd, 1)) != self._prev
         self._prev = (round(fh, 1), round(sd, 1))
@@ -944,6 +991,35 @@ class TokenBar:
     def _on_error(self, msg, wait):
         self._error(msg)
         self._schedule_next(wait)
+
+    def _on_auth_failure(self, fingerprint):
+        """A refused refresh -> suspicion, not a verdict. Wait for corroboration.
+
+        The widget shares one single-use refresh token with Claude Code, so a
+        refusal usually just means we lost a rotation race and our copy went one
+        generation stale — indistinguishable, in the response, from a revoked
+        token. Escalating on the first refusal is what made the bar shout "sign
+        in" while the session was perfectly alive, and sent people through a
+        login they never needed.
+
+        So we escalate only once the evidence holds up: AUTH_CONFIRM_TRIES
+        refusals spanning AUTH_CONFIRM_SECONDS, with the credentials file
+        unchanged throughout. A changed fingerprint means somebody refreshed —
+        the token is demonstrably alive, so the count starts over. Until then we
+        stay quiet: no toast, no red; the dot ages to amber on its own and the
+        countdown keeps ticking, while we retry every minute."""
+        now = time.monotonic()
+        if fingerprint != self._auth_fail_fp:
+            self._auth_fail_fp = fingerprint      # new credentials -> new evidence
+            self._auth_fail_n = 0
+            self._auth_fail_since = now
+        self._auth_fail_n += 1
+        if (self._auth_fail_n >= AUTH_CONFIRM_TRIES
+                and now - self._auth_fail_since >= AUTH_CONFIRM_SECONDS):
+            self._on_needs_login()
+            return
+        self._error("token stale — waiting for Claude Code to refresh")
+        self._schedule_next(60)
 
     def _on_needs_login(self):
         """Sign-in / setup needed -> make it loud and actionable. Distinguish two

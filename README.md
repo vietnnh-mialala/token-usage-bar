@@ -134,6 +134,16 @@ your usage limits; it only reads the meter.
   refreshes itself only as a last resort (e.g. Claude Code isn't running). This
   avoids both the widget and Claude Code rotating the one shared refresh token at
   once (which would 403 the loser), while still keeping the bar working on its own.
+- **Never asks you to sign in on a clock.** The stored access token expires every
+  few hours and Claude Code does not keep the file fresh — it happily works from
+  memory while the copy on disk sits hours past its expiry — so an expired
+  timestamp says nothing about your session, and nothing here reads one to decide
+  anything. Even a *refused* refresh is only a suspicion: the refresh token is
+  single-use, so losing a rotation race to Claude Code returns the very same
+  `invalid_grant` a revoked token would. The bar therefore stays amber and keeps
+  retrying every 60 s, and only turns red after **3 refusals spanning 5 minutes
+  with the credentials file unchanged**. If anything rotates the token in
+  between, the evidence resets — because that proves the session is alive.
 - Crisp on scaled (125 % etc.) displays — it's DPI-aware, so its coordinates are
   in physical pixels.
 
