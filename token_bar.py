@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -64,6 +64,28 @@ if getattr(sys, "frozen", False):
 else:
     _STATE_DIR = os.path.dirname(os.path.abspath(__file__))
 POS_PATH = os.path.join(_STATE_DIR, ".window_pos.json")
+
+
+LOG_PATH = os.path.join(_STATE_DIR, "token-bar.log")
+
+
+def _log(msg):
+    """Append one breadcrumb line. Never raises, never blocks, never records a
+    token — this exists so a future "it just sits there grey" has evidence
+    instead of guesswork, which is exactly what we lacked the first time."""
+    try:
+        try:
+            if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                    keep = f.readlines()[-200:]
+                with open(LOG_PATH, "w", encoding="utf-8") as f:
+                    f.writelines(keep)
+        except OSError:
+            pass
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", file=f)
+    except Exception:
+        pass
 
 
 def _version_tuple(s):
@@ -93,14 +115,19 @@ FRESH_SECONDS = 60         # dot is green while the last good sync is this recen
 TIMEOUT = 15
 UPDATE_CHECK_SECONDS = 6 * 3600   # re-check GitHub for a newer release this often
                                   # (so long-running instances notice updates too)
-REFRESH_GRACE_SECONDS = 8
+REFRESH_GRACE_SECONDS = 8  # wait this long for Claude Code to refresh the shared
+                           # token before the widget refreshes it itself
 
 # A refused refresh is NOT proof the session ended: the refresh token is
 # single-use and shared with Claude Code, so losing a rotation race looks
 # exactly like a revoked token. Corroborate before crying "sign in".
 AUTH_CONFIRM_TRIES = 3        # consecutive refusals needed...
-AUTH_CONFIRM_SECONDS = 300    # ...spanning at least this long (s)  # wait this long for Claude Code to refresh the shared
-                           # token before the widget refreshes it itself
+AUTH_CONFIRM_SECONDS = 300    # ...spanning at least this long (s)
+
+# A fetch cannot honestly take longer than this (15 s usage call + ~12 s refresh
+# grace + 15 s token call + 15 s retry). Past it, the worker is gone, not slow.
+FETCH_STUCK_SECONDS = 120
+LOG_MAX_BYTES = 64 * 1024     # rotate the breadcrumb log at this size
 HOVER_ALPHA = 0.95         # opacity when the mouse is over the window
 IDLE_ALPHA = 0.22          # idle opacity when floating over the desktop
 DOCK_IDLE_ALPHA = 0.6      # idle opacity when docked — higher so the dark bar
@@ -572,6 +599,10 @@ class TokenBar:
         self._auth_fail_fp = None  # fingerprint of the credentials last refused
         self._auth_fail_n = 0      # consecutive refusals of that same fingerprint
         self._auth_fail_since = 0.0  # monotonic clock of the first of them
+        self._fetch_started = 0.0  # monotonic clock of the in-flight fetch
+        self._revivals = 0         # how often the heartbeat had to restart us
+        self._quitting = False     # set on the way out so the watchdog stands down
+        self._degraded = False     # True while the last poll did not succeed
         self._docked = False      # True while overlaying the taskbar
         self._dock_screen_y = 0   # screen y (centred in the taskbar band) when docked
         self._update_ver = None   # set when a newer release is found on GitHub
@@ -943,9 +974,23 @@ class TokenBar:
             self.root.after_cancel(self._timer)
             self._timer = None
         self._fetching = True
+        self._fetch_started = time.monotonic()   # watched by _tick_clock
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
+        try:
+            self._fetch_attempt()
+        except BaseException as e:                 # noqa: BLE001 - last line of defence
+            # Nothing may escape this thread. Every outcome above hands back to
+            # the UI thread, and the hand-back itself is the one step that can
+            # fail (Tk is not thread-safe). If it does, the fetch flag would
+            # stay set and the widget would never poll again — the exact freeze
+            # that left the bar grey with a live clock. Clear it here, and let
+            # the 1 s heartbeat schedule the next attempt.
+            _log(f"worker died: {type(e).__name__}: {e}")
+            self._fetching = False
+
+    def _fetch_attempt(self):
         if is_session_locked():
             self.root.after(0, self._on_locked)
             return
@@ -965,6 +1010,9 @@ class TokenBar:
         self._backoff = FAST_SECONDS
         self._auth_fail_n = 0             # a good sync retires any sign-in suspicion
         self._auth_fail_fp = None
+        if self._degraded or self._last_ok is None:
+            _log(f"ok: 5h={fh:.0f} 7d={sd:.0f}")   # log recoveries, not every poll
+            self._degraded = False
         # adaptive cadence: speed up when the numbers move, slow down when idle
         changed = self._prev is None or (round(fh, 1), round(sd, 1)) != self._prev
         self._prev = (round(fh, 1), round(sd, 1))
@@ -986,10 +1034,14 @@ class TokenBar:
         # the dot is freshness-driven now: a brief rate-limit stays green as long
         # as the last good sync is < FRESH_SECONDS old, then ages to amber
         self._update_dot()
+        self._degraded = True
+        _log(f"rate limited -> next try in {int(wait)}s")
         self._schedule_next(wait)
 
     def _on_error(self, msg, wait):
         self._error(msg)
+        self._degraded = True
+        _log(f"error: {msg} -> next try in {int(wait)}s")
         self._schedule_next(wait)
 
     def _on_auth_failure(self, fingerprint):
@@ -1019,6 +1071,9 @@ class TokenBar:
             self._on_needs_login()
             return
         self._error("token stale — waiting for Claude Code to refresh")
+        self._degraded = True
+        _log(f"refresh refused ({self._auth_fail_n}x, creds {fingerprint or '?'}) "
+             f"— not prompting yet")
         self._schedule_next(60)
 
     def _on_needs_login(self):
@@ -1027,6 +1082,9 @@ class TokenBar:
         but the token is dead)."""
         first = not self._needs_login
         self._needs_login = True
+        self._degraded = True
+        if first:
+            _log("sign-in required (corroborated) — prompting")
         # setup = no creds file AND no CLI -> the widget can't work here yet
         self._setup_mode = (not os.path.exists(CRED_PATH)
                             and self._find_claude_cli() is None)
@@ -1175,10 +1233,36 @@ class TokenBar:
             self.reset_lbl.config(text="⟳ " + _reset_compact(self._reset_iso),
                                   fg=FG)
 
+    def _watchdog(self):
+        """Guarantee that a poll is always either running or scheduled.
+
+        Two ways the loop used to die for good, both silent and both fixed only
+        by restarting the app: a fetch flag that never got cleared (so every
+        later poll returned at the first line), and a dead worker that left no
+        timer behind (so nothing ever fired again). The UI thread is the one
+        thing still ticking in both cases, so it is where the recovery belongs.
+        A stuck fetch and an idle-with-no-timer state are both revived here."""
+        if self._quitting:
+            return
+        now = time.monotonic()
+        if self._fetching:
+            if now - self._fetch_started <= FETCH_STUCK_SECONDS:
+                return                       # still legitimately in flight
+            reason = f"fetch stuck for {int(now - self._fetch_started)}s"
+            self._fetching = False
+        elif self._timer is None:
+            reason = "no poll scheduled"
+        else:
+            return
+        self._revivals += 1
+        _log(f"watchdog: {reason} -> reviving (#{self._revivals})")
+        self._schedule_next(1)
+
     # ---- 1 s heartbeat: countdown + sync freshness + topmost recovery
     def _tick_clock(self):
         self._update_reset_label()      # the 5h countdown ticks every second
         self._update_dot()              # re-evaluate sync freshness
+        self._watchdog()                # ...and make sure polling is still alive
         if not self.hidden:
             assert_topmost(self._hwnd())   # recover fast if the shell covers us
         self.root.after(1000, self._tick_clock)
@@ -1306,6 +1390,7 @@ class TokenBar:
             pass
 
     def quit(self):
+        self._quitting = True       # stop the watchdog from reviving us mid-exit
         self._save_pos()
         if self.icon is not None:
             try:
@@ -1346,6 +1431,7 @@ def main():
             pass
         sys.exit(0)
 
+    _log(f"start v{VERSION} pid={os.getpid()} args={sys.argv[1:]}")
     if updated:
         _cleanup_after_update()    # delete the previous exe the swap left behind
 

@@ -144,6 +144,17 @@ your usage limits; it only reads the meter.
   retrying every 60 s, and only turns red after **3 refusals spanning 5 minutes
   with the credentials file unchanged**. If anything rotates the token in
   between, the evidence resets — because that proves the session is alive.
+- **Cannot quietly stop polling.** A fetch runs on a worker thread and hands its
+  result back to the UI thread; if that hand-back ever fails, the worker dies
+  and the "fetch in flight" flag stays set, so every later poll returns at the
+  first line. That freeze is invisible — the clock keeps ticking, the bar keeps
+  dimming on hover, and only a restart fixes it. The 1 s heartbeat now watches
+  for it: a fetch in flight longer than 2 minutes, or an idle state with no poll
+  scheduled, is revived on the spot.
+- **Leaves breadcrumbs.** `token-bar.log` next to the saved window position keeps
+  the last ~200 lines: startup, recoveries, rate limits, refused refreshes,
+  watchdog revivals. No tokens, ever. It exists because the first time the bar
+  sat there grey, there was nothing to read and the diagnosis was guesswork.
 - Crisp on scaled (125 % etc.) displays — it's DPI-aware, so its coordinates are
   in physical pixels.
 
