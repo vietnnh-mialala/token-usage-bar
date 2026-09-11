@@ -1,7 +1,14 @@
 # winget manifests
 
-Lets people install with `winget install vietnnh-mialala.TokenUsageBar` and
-update with `winget upgrade`.
+> **Status: prepared, never submitted.** These manifests are kept in sync with
+> each release, but no PR has gone to `microsoft/winget-pkgs`, so
+> `winget install` / `winget upgrade` do **not** work for this package today —
+> `winget search TokenUsageBar` finds nothing. Updating happens through the
+> tray's *Check for updates…* instead. Submitting is worth it only if someone
+> other than the author wants to install it.
+
+Once submitted, these let people install with
+`winget install vietnnh-mialala.TokenUsageBar` and update with `winget upgrade`.
 
 ## Publishing a version
 1. Create the GitHub release `vX.Y.Z` with `TokenUsageBar.exe` attached
