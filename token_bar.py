@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -71,6 +71,9 @@ AUTOSTART_PREF_PATH = os.path.join(_STATE_DIR, ".autostart_pref")
 
 
 LOG_PATH = os.path.join(_STATE_DIR, "token-bar.log")
+# last good numbers + any server-imposed "come back at" time, so a restart or
+# a self-update never starts blank-grey and never re-hits a 429 lockout
+USAGE_CACHE_PATH = os.path.join(_STATE_DIR, ".last_usage.json")
 
 
 def _log(msg):
@@ -111,11 +114,19 @@ BETA_HEADER = "oauth-2025-04-20"
 # and Anthropic publishes no rate limit for this internal endpoint, so the
 # "most continuous yet polite" strategy is to poll fast while the numbers are
 # changing and back off automatically when nothing changes / the widget is idle.
-FAST_SECONDS = 30          # floor: when usage is actively changing
-SLOW_SECONDS = 300         # ceiling: when nothing has changed for a while
-HIDDEN_SECONDS = 300       # when the widget is hidden to the tray
-RL_BACKOFF_MAX = 300       # cap on rate-limit back-off so the dot recovers fast
-FRESH_SECONDS = 60         # dot is green while the last good sync is this recent
+#
+# Measured 2026-09: the endpoint is far stricter than a 30 s poll. Polling that
+# fast drew a 429 every 2-3 calls, and from 2026-09-11 each 429 carried
+# Retry-After: 3600 — an hour-long lockout that left the bar grey. The limit is
+# per account (a Claude Code User-Agent gets the same 429), so the only lever is
+# asking less often. Usage moves slowly; minutes-old numbers are fine.
+FAST_SECONDS = 180         # floor: when usage is actively changing
+SLOW_SECONDS = 600         # ceiling: when nothing has changed for a while
+HIDDEN_SECONDS = 900       # when the widget is hidden to the tray
+MANUAL_MIN_GAP = 60        # "Refresh now" / show ignored within this of a call
+RL_BACKOFF_MAX = 1800      # cap on back-off when the 429 carries no Retry-After
+RL_JITTER = 5              # land just after the server's lockout ends, not on it
+FRESH_SECONDS = SLOW_SECONDS + 120   # dot stays green across a normal poll gap
 TIMEOUT = 15
 UPDATE_CHECK_SECONDS = 6 * 3600   # re-check GitHub for a newer release this often
                                   # (so long-running instances notice updates too)
@@ -610,6 +621,8 @@ class TokenBar:
         self._docked = False      # True while overlaying the taskbar
         self._dock_screen_y = 0   # screen y (centred in the taskbar band) when docked
         self._update_ver = None   # set when a newer release is found on GitHub
+        self._rl_until = 0.0      # wall clock before which the server said "no"
+        self._last_call = 0.0     # monotonic clock of the last usage request
 
         # scale factor for the current display (1.0 @ 96dpi, 1.25 @ 120dpi …),
         # so pixel-sized graphics keep their physical size now that we paint
@@ -695,7 +708,7 @@ class TokenBar:
         self.menu = tk.Menu(root, tearoff=0)
         self.menu.add_command(label=f"{APP_NAME} v{VERSION}", state="disabled")
         self.menu.add_separator()
-        self.menu.add_command(label="Refresh now", command=self.refresh_async)
+        self.menu.add_command(label="Refresh now", command=self.manual_refresh)
         self.menu.add_command(label="Dock / Undock taskbar",
                               command=self.toggle_dock)
         self.menu.add_command(label="Hide to tray", command=self.hide)
@@ -719,6 +732,7 @@ class TokenBar:
         self._interval = FAST_SECONDS
         self._prev = None
         self._reset_iso = None      # last known 5h reset time (absolute)
+        cached = self._load_usage_cache()   # show last numbers, not grey dashes
         self.root.update_idletasks()
         self._clamp_pos()           # never restore off-screen / behind taskbar
         if DOCK_TO_TASKBAR:
@@ -736,7 +750,15 @@ class TokenBar:
             else:
                 self._ensure_autostart()
 
-        self.refresh_async()
+        wait = self._rl_until - time.time()
+        if wait > 0:                # still inside a lockout from a previous run
+            _log(f"start inside rate-limit lockout -> first try in {int(wait)}s"
+                 f" (cached numbers: {'yes' if cached else 'no'})")
+            self._error("rate limited — showing last known numbers")
+            self._degraded = True   # so the eventual recovery is logged
+            self._schedule_next(wait)
+        else:
+            self.refresh_async()
         self._dim_tick()
         self._tick_clock()          # 1 s heartbeat: countdown + freshness + topmost
         self.root.after(3000, self._check_update)   # first GitHub update check
@@ -1016,14 +1038,33 @@ class TokenBar:
             self._autostart_var.set(self._autostart_enabled())
 
     # ---- usage refresh
+    def manual_refresh(self, source="menu"):
+        """User-initiated poll (Refresh now / un-hide). Never allowed to punch
+        through a server lockout or stack on a request made moments ago —
+        each extra call risks turning a short 429 into an hour-long one."""
+        left = self._rl_until - time.time()
+        if left > 0:
+            _log(f"{source} refresh skipped: rate-limited {int(left)}s more")
+            self._error(f"rate limited — retry at "
+                        f"{time.strftime('%H:%M', time.localtime(self._rl_until))}")
+            return
+        if time.monotonic() - self._last_call < MANUAL_MIN_GAP:
+            return
+        self.refresh_async()
+
     def refresh_async(self):
         if self._fetching:           # a fetch is already in flight -> coalesce
+            return
+        left = self._rl_until - time.time()
+        if left > 1:                 # never call inside a lockout, whoever asks
+            self._schedule_next(left)   # re-arm: a fired timer id is stale
             return
         if self._timer is not None:
             self.root.after_cancel(self._timer)
             self._timer = None
         self._fetching = True
         self._fetch_started = time.monotonic()   # watched by _tick_clock
+        self._last_call = self._fetch_started
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
@@ -1057,6 +1098,7 @@ class TokenBar:
 
     def _on_success(self, fh, sd, reset):
         self._backoff = FAST_SECONDS
+        self._rl_until = 0.0
         self._auth_fail_n = 0             # a good sync retires any sign-in suspicion
         self._auth_fail_fp = None
         if self._degraded or self._last_ok is None:
@@ -1070,16 +1112,21 @@ class TokenBar:
         else:
             self._interval = min(int(self._interval * 1.5), SLOW_SECONDS)
         self._render(fh, sd, reset)
+        self._save_usage_cache()
         wait = HIDDEN_SECONDS if self.hidden else self._interval
         self._schedule_next(wait)
 
     def _on_rate_limit(self, retry_after):
-        # honour Retry-After if given, else exponential back-off up to 10 min
+        # honour Retry-After if given, else exponential back-off
         if retry_after and retry_after > 0:
-            wait = retry_after
+            wait = retry_after + RL_JITTER
         else:
             self._backoff = min(self._backoff * 2, RL_BACKOFF_MAX)
             wait = self._backoff
+        self._rl_until = time.time() + wait      # persisted: survives a restart
+        self._save_usage_cache()
+        self._error(f"rate limited — retry at "
+                    f"{time.strftime('%H:%M', time.localtime(self._rl_until))}")
         # the dot is freshness-driven now: a brief rate-limit stays green as long
         # as the last good sync is < FRESH_SECONDS old, then ages to amber
         self._update_dot()
@@ -1213,6 +1260,44 @@ class TokenBar:
         # workstation locked -> pause network calls, re-probe every 60s
         self._update_dot()
         self._schedule_next(60)
+
+    # ---- last-known usage cache (survives restarts and self-updates)
+    def _load_usage_cache(self):
+        try:
+            with open(USAGE_CACHE_PATH, encoding="utf-8") as f:
+                c = json.load(f)
+        except Exception:
+            return False
+        try:
+            self._rl_until = float(c.get("rl_until") or 0.0)
+            if self._rl_until - time.time() > 2 * 3600:   # clock skew / garbage
+                self._rl_until = 0.0
+            ts = float(c.get("ts") or 0.0)
+            if not ts:
+                return False
+            fh, sd = float(c["fh"]), float(c["sd"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._render(fh, sd, c.get("reset") or "")
+        self._prev = (round(fh, 1), round(sd, 1))
+        # age the freshness clock to the real sync time, so the dot is honest
+        self._last_ok = time.monotonic() - max(0.0, time.time() - ts)
+        self._update_dot()
+        return True
+
+    def _save_usage_cache(self):
+        try:
+            data = {"rl_until": self._rl_until}
+            if self._last_ok is not None:
+                data.update(fh=self._last[0], sd=self._last[1],
+                            reset=self._reset_iso or "",
+                            ts=time.time() - (time.monotonic() - self._last_ok))
+            tmp = USAGE_CACHE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, USAGE_CACHE_PATH)
+        except Exception:
+            pass
 
     def _schedule_next(self, secs):
         # common tail of every fetch outcome -> the fetch is now done
@@ -1359,7 +1444,7 @@ class TokenBar:
         self.root.deiconify()
         self.root.attributes("-topmost", True)
         self._interval = FAST_SECONDS
-        self.refresh_async()
+        self.manual_refresh("show")
 
     def toggle(self):
         self.root.after(0, self.show if self.hidden else self.hide)
@@ -1495,7 +1580,7 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Show / Hide", lambda: app.toggle(), default=True),
         pystray.MenuItem("Refresh now",
-                         lambda: root.after(0, app.refresh_async)),
+                         lambda: root.after(0, app.manual_refresh)),
         pystray.MenuItem("Dock / Undock taskbar", lambda: app.toggle_dock()),
         pystray.MenuItem("Start with Windows",
                          lambda: app._set_autostart(not app._autostart_enabled(),
