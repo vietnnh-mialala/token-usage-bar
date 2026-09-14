@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -64,6 +64,10 @@ if getattr(sys, "frozen", False):
 else:
     _STATE_DIR = os.path.dirname(os.path.abspath(__file__))
 POS_PATH = os.path.join(_STATE_DIR, ".window_pos.json")
+# the user's own "Start with Windows" choice. The Run value itself is not a
+# trustworthy record of it: startup optimizers / cleaners delete it silently,
+# and then the bar simply never comes back after a reboot (seen 2026-09-12).
+AUTOSTART_PREF_PATH = os.path.join(_STATE_DIR, ".autostart_pref")
 
 
 LOG_PATH = os.path.join(_STATE_DIR, "token-bar.log")
@@ -698,7 +702,8 @@ class TokenBar:
         self._autostart_var = tk.BooleanVar(value=self._autostart_enabled())
         self.menu.add_checkbutton(
             label="Start with Windows", variable=self._autostart_var,
-            command=lambda: self._set_autostart(self._autostart_var.get()))
+            command=lambda: self._set_autostart(self._autostart_var.get(),
+                                                source="window menu"))
         self.menu.add_command(label="🔑 Sign in to Claude…",
                               command=self._sign_in)
         self._signin_idx = self.menu.index("end")   # relabelled in setup mode
@@ -723,11 +728,13 @@ class TokenBar:
         if getattr(sys, "frozen", False) and winreg is not None:
             marker = os.path.join(_STATE_DIR, ".autostart_init")
             if not os.path.exists(marker):
-                self._set_autostart(True)
+                self._set_autostart(True, source="first run")
                 try:
                     open(marker, "w").close()
                 except OSError:
                     pass
+            else:
+                self._ensure_autostart()
 
         self.refresh_async()
         self._dim_tick()
@@ -948,9 +955,51 @@ class TokenBar:
         except OSError:
             return False
 
-    def _set_autostart(self, on):
+    def _read_autostart_pref(self):
+        try:
+            with open(AUTOSTART_PREF_PATH, encoding="utf-8") as f:
+                return f.read().strip() == "on"
+        except OSError:
+            return None                     # never recorded (pre-1.0.16 install)
+
+    def _write_autostart_pref(self, on):
+        try:
+            with open(AUTOSTART_PREF_PATH, "w", encoding="utf-8") as f:
+                f.write("on" if on else "off")
+        except OSError:
+            pass
+
+    def _autostart_value(self):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+                return winreg.QueryValueEx(k, APP_SLUG)[0]
+        except OSError:
+            return None
+
+    def _ensure_autostart(self):
+        """Put the Run value back if something other than the user removed it
+        (or it points at an old path). Only the menu toggle records "off"."""
+        pref = self._read_autostart_pref()
+        value = self._autostart_value()
+        if pref is None:
+            # upgrading from <=1.0.15: adopt whatever the registry says now
+            self._write_autostart_pref(value is not None)
+            _log(f"autostart pref recorded from registry: "
+                 f"{'on' if value is not None else 'off'}")
+            return
+        if not pref:
+            return
+        target = self._autostart_target()
+        if value != target:
+            self._set_autostart(True, source="self-repair")
+            _log(f"autostart repaired (Run value was "
+                 f"{'missing' if value is None else repr(value)})")
+
+    def _set_autostart(self, on, source="tray menu"):
         if winreg is None:
             return
+        self._write_autostart_pref(on)
+        _log(f"autostart {'on' if on else 'off'} ({source})")
         try:
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
                 if on:
@@ -1390,6 +1439,7 @@ class TokenBar:
             pass
 
     def quit(self):
+        _log("quit (menu)")
         self._quitting = True       # stop the watchdog from reviving us mid-exit
         self._save_pos()
         if self.icon is not None:
@@ -1448,7 +1498,8 @@ def main():
                          lambda: root.after(0, app.refresh_async)),
         pystray.MenuItem("Dock / Undock taskbar", lambda: app.toggle_dock()),
         pystray.MenuItem("Start with Windows",
-                         lambda: app._set_autostart(not app._autostart_enabled()),
+                         lambda: app._set_autostart(not app._autostart_enabled(),
+                                                    source="tray menu"),
                          checked=lambda item: app._autostart_enabled()),
         pystray.MenuItem("Sign in to Claude…", lambda: app._sign_in()),
         pystray.MenuItem("Check for updates…", lambda: app._open_releases()),
