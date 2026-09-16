@@ -32,8 +32,13 @@ No Python needed — a self-contained `TokenUsageBar.exe` is provided.
 1. Unzip the download, then **double-click `Install.cmd`**.
 
 It copies the exe to `%LOCALAPPDATA%\TokenUsageBar`, enables **start-at-login**
-(HKCU `Run` key), and starts it now. No admin rights required. You can toggle
-start-at-login any time from the right-click menu → **Start with Windows**.
+(HKCU `Run` key), adds a **Start Menu** entry, and starts it now. No admin rights
+required. You can toggle start-at-login any time from the right-click menu →
+**Start with Windows**.
+
+Closed it and want it back? Press Start and type **Token**. (The Start Menu entry
+is why that works: `%LOCALAPPDATA%` itself is not indexed by Windows Search, so
+without it the only way to relaunch is typing the full path to the exe.)
 
 To remove it later, **double-click `Uninstall.cmd`**.
 
