@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -210,6 +210,17 @@ def _token_from_file():
         return o.get("accessToken"), _expires_at_ms(o)
     except Exception:
         return None, 0
+
+
+def _disk_token_id():
+    """Short identity of the access token on disk — changes on every rotation.
+
+    One-way and truncated, so it is not the token and is never logged in full;
+    it only answers "is this a different token than our last call used?"."""
+    tok, exp = _token_from_file()
+    if not tok:
+        return ""
+    return f"{hashlib.sha256(tok.encode()).hexdigest()[:12]}@{exp}"
 
 
 def _refresh_fingerprint():
@@ -415,20 +426,28 @@ def fetch_usage():
     return float(fh), float(sd), reset
 
 
+def _reset_epoch(iso):
+    """`resets_at` as a POSIX timestamp, or 0.0 when it can't be read."""
+    if not iso:
+        return 0.0
+    try:
+        from datetime import datetime
+        t = datetime.fromisoformat(iso)
+        return 0.0 if t.tzinfo is None else t.timestamp()
+    except Exception:
+        return 0.0
+
+
 def _reset_compact(iso):
     """Time left until the 5h limit resets as 'h:mm:ss' (or 'reset' once due)."""
-    if not iso:
+    at = _reset_epoch(iso)
+    if not at:
         return "—"
-    try:
-        from datetime import datetime, timezone
-        t = datetime.fromisoformat(iso)
-        secs = int((t - datetime.now(timezone.utc)).total_seconds())
-        if secs <= 0:
-            return "reset"
-        h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
-        return f"{h}:{m:02d}:{s:02d}"
-    except Exception:
-        return "—"
+    secs = int(at - time.time())
+    if secs <= 0:
+        return "reset"
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h}:{m:02d}:{s:02d}"
 
 
 # ---------------------------------------------------------------- colors / icon
@@ -623,6 +642,8 @@ class TokenBar:
         self._update_ver = None   # set when a newer release is found on GitHub
         self._rl_until = 0.0      # wall clock before which the server said "no"
         self._last_call = 0.0     # monotonic clock of the last usage request
+        self._creds_seen_mtime = None  # mtime of the credentials file we last read
+        self._token_id = None      # identity of the token on disk at that point
 
         # scale factor for the current display (1.0 @ 96dpi, 1.25 @ 120dpi …),
         # so pixel-sized graphics keep their physical size now that we paint
@@ -1210,8 +1231,13 @@ class TokenBar:
                     self.icon.notify(msg, APP_NAME)
             except Exception:
                 pass
-        # keep polling so we recover automatically once it's set up / signed in
-        self._schedule_next(60)
+        # Keep polling so we recover automatically once it is set up / signed in
+        # — but slowly. Every blind retry here is a request the server counts
+        # while it cannot possibly succeed, which is how a dead token earned an
+        # hour-long 429 on top of itself. Recovery no longer depends on this
+        # cadence: _poke_on_new_token fires the instant Claude Code writes a
+        # working token.
+        self._schedule_next(300)
 
     def _find_claude_cli(self):
         """Locate the Claude Code CLI, or None. shutil.which alone is unreliable
@@ -1359,10 +1385,34 @@ class TokenBar:
                 pass
 
     # ---- 5h-reset countdown (local, network-independent)
+    def _stale_since(self):
+        """Wall clock of the last good sync, when the numbers on screen belong
+        to a 5h window that has already closed. None while they are current.
+
+        Past the reset moment the server's counters start again from zero, but
+        the widget only learns that by fetching — and a fetch is exactly what a
+        lockout or a dead token denies it. Meanwhile the label counted down to
+        that reset and then sat on the word "reset", which reads as *just
+        refreshed* when it means the opposite: these are last cycle's numbers,
+        and nothing has been able to ask for new ones since."""
+        if self._last_ok is None or not self._reset_iso:
+            return None
+        reset_at = _reset_epoch(self._reset_iso)
+        if not reset_at or reset_at > time.time():
+            return None                       # window open -> the countdown is true
+        synced = time.time() - (time.monotonic() - self._last_ok)
+        return synced if synced < reset_at else None
+
     def _update_reset_label(self):
         if self._needs_login:
             self.reset_lbl.config(text="⚠ setup" if self._setup_mode
                                   else "⚠ sign in", fg=DOT_ERR)
+            return
+        stale = self._stale_since()
+        if stale is not None:                 # say whose numbers these are
+            self.reset_lbl.config(
+                text="⌛ " + time.strftime("%H:%M", time.localtime(stale)),
+                fg=SUB)
         else:
             self.reset_lbl.config(text="⟳ " + _reset_compact(self._reset_iso),
                                   fg=FG)
@@ -1392,11 +1442,50 @@ class TokenBar:
         _log(f"watchdog: {reason} -> reviving (#{self._revivals})")
         self._schedule_next(1)
 
+    def _poke_on_new_token(self):
+        """Spend one call the moment Claude Code puts a fresh token on disk.
+
+        The dead end this clears used to eat whole mornings: the access token on
+        disk expires, our poll 401s, our refresh is refused (Claude Code owns
+        the rotation), and the retries earn an hour-long 429 — or a corroborated
+        "sign in". Minutes later Claude Code writes a fresh token, the one thing
+        that would make the next call work, and we sit out the lockout anyway,
+        showing last cycle's numbers. A rotated token is new evidence, so it is
+        worth one request: a 429 still in force simply re-arms the lockout, and
+        an extra call does not push its deadline out.
+
+        Cheap enough for the 1 s heartbeat: a stat of the credentials file, and
+        a read only on the ticks where its mtime actually moved."""
+        if self._quitting or self._fetching:
+            return
+        try:
+            mtime = os.path.getmtime(CRED_PATH)
+        except OSError:
+            return
+        if mtime == self._creds_seen_mtime:
+            return
+        self._creds_seen_mtime = mtime
+        token_id = _disk_token_id()
+        if not token_id or token_id == self._token_id:
+            return                       # file rewritten, same token -> nothing new
+        first = self._token_id is None   # startup snapshot: learn, don't poke
+        self._token_id = token_id
+        if first:
+            return
+        if not (self._needs_login or self._rl_until - time.time() > 1):
+            return                       # polling normally -> nothing to punch through
+        if time.monotonic() - self._last_call < MANUAL_MIN_GAP:
+            return                       # a call moments ago already carried it
+        _log("new token on disk -> one try, skipping the wait")
+        self._rl_until = 0.0
+        self.refresh_async()
+
     # ---- 1 s heartbeat: countdown + sync freshness + topmost recovery
     def _tick_clock(self):
         self._update_reset_label()      # the 5h countdown ticks every second
         self._update_dot()              # re-evaluate sync freshness
         self._watchdog()                # ...and make sure polling is still alive
+        self._poke_on_new_token()       # ...and pounce on a freshly rotated token
         if not self.hidden:
             assert_topmost(self._hwnd())   # recover fast if the shell covers us
         self.root.after(1000, self._tick_clock)
