@@ -1,6 +1,7 @@
 # Installs Token Usage Bar for the current user (no admin required):
 #   - copies TokenUsageBar.exe to %LOCALAPPDATA%\TokenUsageBar
 #   - adds an HKCU Run entry so it launches automatically at login
+#   - adds a Start Menu entry, so you can find it again later
 #   - starts it now
 #
 # EASIEST: double-click  Install.cmd  (works even when PowerShell's execution
@@ -67,11 +68,35 @@ try {
     New-ItemProperty -Path $run -Name 'TokenUsageBar' -Value ('"{0}"' -f $exe) `
         -PropertyType String -Force | Out-Null
 
+    # Start Menu entry. Without one the app is effectively unfindable once it
+    # is closed: the exe lives under %LOCALAPPDATA%, which Windows Search does
+    # not index, so "Token" in Start returns nothing and the only way back in is
+    # typing the full path. A .lnk in the per-user Programs folder is indexed.
+    $menuNote = $null
+    try {
+        $programs = [Environment]::GetFolderPath('Programs')
+        if (-not $programs) { throw 'no Start Menu Programs folder for this profile' }
+        $sh = New-Object -ComObject WScript.Shell
+        $sc = $sh.CreateShortcut((Join-Path $programs 'Token Usage Bar.lnk'))
+        $sc.TargetPath = $exe
+        $sc.WorkingDirectory = $dest
+        $sc.IconLocation = $exe
+        $sc.Description = 'Claude usage (5h / 7d) on the taskbar'
+        $sc.Save()
+        $menuNote = 'Added a Start Menu entry (press Start, type "Token").'
+    }
+    catch {
+        # never fail an otherwise good install over a shortcut
+        $menuNote = "NOTE: could not add the Start Menu entry ($($_.Exception.Message))." +
+                    " Launch it from $exe"
+    }
+
     Start-Process $exe
 
     $ver = (Get-Item $exe).VersionInfo.FileVersion
     Write-Host "Installed v$ver to $dest" -ForegroundColor Green
     Write-Host 'Enabled start-at-login (HKCU Run -> TokenUsageBar).'
+    Write-Host $menuNote
     Write-Host 'Token Usage Bar is now running (bottom-left of your taskbar).'
 }
 catch {

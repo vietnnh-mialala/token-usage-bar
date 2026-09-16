@@ -36,7 +36,14 @@ if (Test-Path $lnk) {
     catch { $failed += "Startup shortcut: $($_.Exception.Message)" }
 }
 
-# 4) install folder (exe + saved window position)
+# 4) Start Menu entry
+$menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Token Usage Bar.lnk'
+if (Test-Path $menu) {
+    try { Remove-Item $menu -Force -ErrorAction Stop; $removed += 'Start Menu entry' }
+    catch { $failed += "Start Menu entry: $($_.Exception.Message)" }
+} else { $missing += 'Start Menu entry (already absent)' }
+
+# 5) install folder (exe + saved window position)
 $dest = Join-Path $env:LOCALAPPDATA 'TokenUsageBar'
 if (Test-Path $dest) {
     try { Remove-Item -Recurse -Force $dest -ErrorAction Stop; $removed += "install folder ($dest)" }

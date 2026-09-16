@@ -15,6 +15,7 @@ CÀI ĐẶT (3 bước)
   3) Đợi cửa sổ chạy xong -> nhấn Enter.
 
   => Thanh bar hiện ở góc trái taskbar và tự khởi động cùng Windows.
+     Mở lại sau khi Quit: bấm Start, gõ  Token  -> Enter.
 
 NẾU WINDOWS CẢNH BÁO
   "Windows protected your PC" -> More info -> Run anyway.
