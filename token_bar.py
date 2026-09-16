@@ -48,7 +48,7 @@ CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 
 APP_NAME = "Token Usage Bar"       # display name (window / tray / dialogs)
 APP_SLUG = "TokenUsageBar"         # filesystem / mutex / identifier-safe name
-VERSION = "1.0.19"
+VERSION = "1.0.20"
 REPO = "vietnnh-mialala/token-usage-bar"   # GitHub owner/repo for update checks
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # HKCU autostart
 
@@ -770,6 +770,7 @@ class TokenBar:
                     pass
             else:
                 self._ensure_autostart()
+            self._ensure_start_menu_entry()
 
         wait = self._rl_until - time.time()
         if wait > 0:                # still inside a lockout from a previous run
@@ -1057,6 +1058,60 @@ class TokenBar:
             pass
         if hasattr(self, "_autostart_var"):
             self._autostart_var.set(self._autostart_enabled())
+
+    # ---- Start Menu entry (so Quit is not a one-way door)
+    def _start_menu_lnk(self):
+        """Path of this user's Start Menu shortcut, or None if there is no
+        profile to put one in."""
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                            "Programs", f"{APP_NAME}.lnk")
+
+    def _ensure_start_menu_entry(self):
+        """Give Start something to find, once, off the UI thread.
+
+        Quitting used to be a one-way door: the exe sits under %LOCALAPPDATA%,
+        which Windows Search does not index, so typing "Token" into Start finds
+        nothing and the only way back in is knowing the full path to the exe —
+        which is exactly how this widget became unreachable on a real machine.
+        The installer writes a shortcut now; this covers everyone who just ran
+        the downloaded exe instead. Once only, remembered by a marker file, so a
+        shortcut somebody deletes on purpose stays deleted."""
+        threading.Thread(target=self._write_start_menu_entry, daemon=True).start()
+
+    def _write_start_menu_entry(self):
+        """Worker for the above. Never raises: a missing shortcut is a small
+        inconvenience, and nothing here is worth a failed start."""
+        marker = os.path.join(_STATE_DIR, ".shortcut_init")
+        if os.path.exists(marker):
+            return
+        lnk = self._start_menu_lnk()
+        if not lnk:
+            return
+        try:
+            if not os.path.exists(lnk):
+                os.makedirs(os.path.dirname(lnk), exist_ok=True)
+                exe = sys.executable
+                # single quotes are PowerShell's literal string; a quote
+                # inside a path (usernames may hold one) is escaped by doubling
+                def q(v):
+                    return "'" + v.replace("'", "''") + "'"
+                ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({q(lnk)});"
+                      f"$s.TargetPath={q(exe)};"
+                      f"$s.WorkingDirectory={q(os.path.dirname(exe))};"
+                      f"$s.IconLocation={q(exe)};"
+                      f"$s.Description={q(APP_NAME)};$s.Save()")
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=30, check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _log("start menu shortcut created")
+            open(marker, "w").close()
+        except Exception as e:                        # noqa: BLE001 - best effort
+            _log(f"start menu shortcut skipped: {type(e).__name__}")
 
     # ---- usage refresh
     def manual_refresh(self, source="menu"):

@@ -40,6 +40,9 @@ Closed it and want it back? Press Start and type **Token**. (The Start Menu entr
 is why that works: `%LOCALAPPDATA%` itself is not indexed by Windows Search, so
 without it the only way to relaunch is typing the full path to the exe.)
 
+Ran the bare `TokenUsageBar.exe` instead of the installer? It adds the same Start
+Menu entry itself, on first run — once only, so one you delete stays deleted.
+
 To remove it later, **double-click `Uninstall.cmd`**.
 
 > **Why `Install.cmd` and not the `.ps1` directly?** Windows' default execution
